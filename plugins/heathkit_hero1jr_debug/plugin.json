@@ -1,0 +1,10 @@
+{
+  "plugin": {
+    "name": "heathkit_hero1jr_debug",
+    "description": "Heathkit HERO 1/Jr VS Code debug bridge",
+    "version": "0.0.1",
+    "author": "Paul Czywczynski",
+    "type": "plugin",
+    "start": "false"
+  }
+}

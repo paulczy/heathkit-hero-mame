@@ -1,0 +1,15 @@
+// license:BSD-3-Clause
+// copyright-holders:Paul Czywczynski
+/*******************************************************************************
+
+    heathkit_hero.lst
+
+    Driver list for the slim Heathkit HERO runtime subtarget.
+
+*******************************************************************************/
+
+@source:heathkit/hero1.cpp
+hero1
+
+@source:heathkit/herojr.cpp
+herojr
