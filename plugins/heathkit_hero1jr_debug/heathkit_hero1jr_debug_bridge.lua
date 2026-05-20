@@ -101,7 +101,9 @@ local host = os.getenv("HEATHKIT_HERO_BRIDGE_HOST") or "127.0.0.1"
 local port = tonumber(os.getenv("HEATHKIT_HERO_BRIDGE_PORT") or "6808")
 local autostart_monitor = os.getenv("HEATHKIT_HERO_BRIDGE_AUTOSTART_MONITOR") == "1"
 local bridge_trace = os.getenv("HEATHKIT_HERO_BRIDGE_TRACE") == "1"
+local herojr_initial_sleep = os.getenv("HEATHKIT_HEROJR_INITIAL_SLEEP") == "1"
 local autostart_monitor_pending = autostart_monitor
+local herojr_initial_sleep_pending = herojr_initial_sleep
 local sensor_base = 0xd100
 local herojr_sensor_base = 0xd860
 local keypad_base = 0xd104
@@ -118,6 +120,7 @@ local temp_step_breakpoints = {}
 local last_stop_pc = nil
 local console_log_last = 0
 local last_io_state_encoded = nil
+local last_io_broadcast_time = 0
 local sensor_state = {
   sonarDistanceInches = 48,
   sonarHits = 0,
@@ -304,6 +307,10 @@ local function set_herojr_keypad_field(key, pressed)
 end
 
 local function set_herojr_sleep_norm_field(norm)
+  if not manager.machine then
+    return false
+  end
+
   local system = manager.machine.system
   if not system or system.name ~= "herojr" then
     return false
@@ -319,13 +326,41 @@ local function set_herojr_sleep_norm_field(norm)
     return false
   end
 
-  field.user_value = norm and 1 or 0
+  -- SLEEP_NORM defaults to NORM in the driver. MAME folds programmatic
+  -- digital values through that default on read, so the held state reads Sleep.
+  field:set_value(norm and 0 or 1)
+  return true
+end
+
+local function set_herojr_reset_field(pressed)
+  if not manager.machine then
+    return false
+  end
+
+  local system = manager.machine.system
+  if not system or system.name ~= "herojr" then
+    return false
+  end
+
+  local port = manager.machine.ioport.ports[":RESET"] or manager.machine.ioport.ports["RESET"]
+  if not port then
+    return false
+  end
+
+  local field = port:field(0x01)
+  if not field then
+    return false
+  end
+
+  field:set_value(pressed and 1 or 0)
   return true
 end
 local subscriptions = {}
 local pending_step_reason = nil
 local pending_step_start_pc = nil
 local pending_step_seen_run = false
+local pending_herojr_reset_release_frames = 0
+local pending_herojr_warm_reset_frames = 0
 local supported_commands = {
   "get_capabilities",
   "get_registers",
@@ -1122,9 +1157,10 @@ local function get_io_state()
   return state
 end
 
-local function broadcast_io_changed()
+local function broadcast_io_changed(force)
   if #clients == 0 then
     last_io_state_encoded = nil
+    last_io_broadcast_time = 0
     return
   end
   if not program_space_available() then
@@ -1134,7 +1170,12 @@ local function broadcast_io_changed()
   local state = get_io_state()
   local encoded = encode_json(state)
   if encoded ~= last_io_state_encoded then
+    local now = emu.time()
+    if not force and now < last_io_broadcast_time + 0.05 then
+      return
+    end
     last_io_state_encoded = encoded
+    last_io_broadcast_time = now
     broadcast_event("io_changed", state)
   end
 end
@@ -1326,7 +1367,7 @@ local function set_sensor(params)
     sensor_state.tapeIn = params.value and true or false
     write_u8(sensor_base + 0x0b, sensor_state.tapeIn and 1 or 0)
   end
-  broadcast_io_changed()
+  broadcast_io_changed(true)
   return {}
 end
 
@@ -1339,10 +1380,14 @@ local function press_key(params)
     write_keypad_column(mapping.column)
   end
   if system_name() == "herojr" then
-    set_herojr_keypad_field(key, true)
+    if key == "RESET" then
+      set_herojr_reset_field(true)
+    else
+      set_herojr_keypad_field(key, true)
+    end
     write_u8(0xd820, herojr_keypad_byte())
   end
-  broadcast_io_changed()
+  broadcast_io_changed(true)
   return {}
 end
 
@@ -1355,10 +1400,14 @@ local function release_key(params)
     write_keypad_column(mapping.column)
   end
   if system_name() == "herojr" then
-    set_herojr_keypad_field(key, false)
+    if key == "RESET" then
+      set_herojr_reset_field(false)
+    else
+      set_herojr_keypad_field(key, false)
+    end
     write_u8(0xd820, 0xfe)
   end
-  broadcast_io_changed()
+  broadcast_io_changed(true)
   return {}
 end
 
@@ -1374,28 +1423,30 @@ local function set_sleep_norm(params)
     error("set_sleep_norm requires HERO Jr SLEEP_NORM input")
   end
 
-  broadcast_io_changed()
+  broadcast_io_changed(true)
   return { sleepNorm = norm and 1 or 0 }
 end
 
+local function seed_herojr_warm_rtc_context()
+  -- The v1.6 reset path reads MC146818 register $0E after confirming register
+  -- $0D bit 7.  A fresh emulator has this retained CMOS byte clear, which
+  -- makes the ROM take the first-time diagnostic path.  A physical warm start
+  -- reaches reset from retained sleep state, so preserve that context here.
+  write_u8(0xd810, 0x0e)
+  write_u8(0xd811, 0xff)
+end
+
 local function warm_start()
-  if not set_herojr_sleep_norm_field(false) then
-    error("warm_start requires HERO Jr SLEEP_NORM input")
-  end
-
-  manager.machine:soft_reset()
-  emu.unpause()
-  cpu_debug():go()
-
   if not set_herojr_sleep_norm_field(true) then
     error("warm_start requires HERO Jr SLEEP_NORM input")
   end
 
-  manager.machine:soft_reset()
+  seed_herojr_warm_rtc_context()
+  pending_herojr_warm_reset_frames = 2
   emu.unpause()
   cpu_debug():go()
-  broadcast_io_changed()
-  return { sleepNorm = 1, sequence = "sleep-norm-reset" }
+  broadcast_io_changed(true)
+  return { sleepNorm = 1, rtcWarmFlag = 0xff, sequence = "sleep-norm-reset-key" }
 end
 
 local function reset_machine(params)
@@ -1417,13 +1468,21 @@ local function reset_machine(params)
       write_u8(0xd820, 0xfe)
     end
   end
-  manager.machine:soft_reset()
-  if preserve_herojr_keys then
-    write_u8(0xd820, herojr_keypad_byte())
+  if system_name() == "herojr" then
+    set_herojr_reset_field(false)
+    if not set_herojr_reset_field(true) then
+      error("reset_machine requires HERO Jr RESET input")
+    end
+    pending_herojr_reset_release_frames = 2
+    if preserve_herojr_keys then
+      write_u8(0xd820, herojr_keypad_byte())
+    end
+  else
+    manager.machine:soft_reset()
   end
   emu.unpause()
   cpu_debug():go()
-  broadcast_io_changed()
+  broadcast_io_changed(true)
   return {}
 end
 
@@ -1535,6 +1594,27 @@ local function poll_client(client)
 end
 
 local function poll()
+  if herojr_initial_sleep_pending and set_herojr_sleep_norm_field(false) then
+    herojr_initial_sleep_pending = false
+    emu.print_info("heathkit_hero1jr_debug: initialized HERO Jr Sleep/Norm switch to Sleep")
+  end
+
+  if pending_herojr_reset_release_frames > 0 then
+    pending_herojr_reset_release_frames = pending_herojr_reset_release_frames - 1
+    if pending_herojr_reset_release_frames == 0 then
+      set_herojr_reset_field(false)
+    end
+  end
+
+  if pending_herojr_warm_reset_frames > 0 then
+    pending_herojr_warm_reset_frames = pending_herojr_warm_reset_frames - 1
+    if pending_herojr_warm_reset_frames == 0 then
+      set_herojr_reset_field(false)
+      set_herojr_reset_field(true)
+      pending_herojr_reset_release_frames = 2
+    end
+  end
+
   if autostart_monitor_pending and cpu_debug_available() and program_space_available() then
     local vector_ok, vector = pcall(reset_vector)
     if not vector_ok then
@@ -1647,6 +1727,7 @@ function bridge.start()
   server = assert(socket.bind(host, port))
   server:settimeout(0)
   emu.register_periodic(poll)
+  emu.register_frame_done(poll)
   subscriptions[#subscriptions + 1] = emu.add_machine_stop_notifier(function()
     for _, client in ipairs(clients) do
       client:close()

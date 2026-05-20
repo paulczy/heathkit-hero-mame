@@ -21,11 +21,13 @@
 #include "machine/6850acia.h"
 #include "machine/clock.h"
 #include "machine/mc146818.h"
+#include "osdcore.h"
 #include "sound/votrax.h"
 
 #include "speaker.h"
 
 #include <algorithm>
+#include <cstring>
 
 
 namespace {
@@ -73,6 +75,7 @@ public:
 
 	void herojr(machine_config &config) ATTR_COLD;
 	DECLARE_INPUT_CHANGED_MEMBER(sleep_norm_changed);
+	DECLARE_INPUT_CHANGED_MEMBER(reset_changed);
 
 protected:
 	virtual void machine_start() override ATTR_COLD;
@@ -120,6 +123,9 @@ private:
 	void update_u214_input_outputs();
 	void update_irq_line();
 	void update_speech_power();
+	void set_sleep_norm_input(bool norm);
+	void reset_interface_state();
+	void pulse_reset_line();
 	TIMER_CALLBACK_MEMBER(rtc_square_wave_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 
@@ -188,6 +194,7 @@ private:
 	u32 m_drive_activity_count = 0;
 	emu_timer *m_rtc_square_wave_timer = nullptr;
 	emu_timer *m_sonar_echo_timer = nullptr;
+	memory_passthrough_handler m_sleep_loop_tap;
 };
 
 void herojr_state::machine_start()
@@ -212,6 +219,10 @@ void herojr_state::machine_start()
 	m_rs232_status_output.resolve();
 	m_rs232_data_output.resolve();
 	m_port_outputs.resolve();
+
+	const char *const initial_sleep = osd_getenv("HEATHKIT_HEROJR_INITIAL_SLEEP");
+	if (initial_sleep && !std::strcmp(initial_sleep, "1"))
+		set_sleep_norm_input(false);
 
 	save_item(NAME(m_u214_port_a));
 	save_item(NAME(m_keypad_bridge_byte));
@@ -244,19 +255,39 @@ void herojr_state::machine_start()
 
 	m_rtc_square_wave_timer = timer_alloc(FUNC(herojr_state::rtc_square_wave_tick), this);
 	m_sonar_echo_timer = timer_alloc(FUNC(herojr_state::sonar_echo_tick), this);
+	m_sleep_loop_tap = m_maincpu->space(AS_PROGRAM).install_read_tap(
+		0xec32,
+		0xec32,
+		"herojr_sleep_loop",
+		[this](offs_t offset, u8 &data, u8 mem_mask)
+		{
+			if ((m_maincpu->pc() & 0xffff) == 0xec32)
+				m_maincpu->spin_until_time(attotime::from_msec(10));
+		});
 }
 
-void herojr_state::machine_reset()
+void herojr_state::set_sleep_norm_input(bool norm)
 {
+	ioport_field *const field = m_sleep_norm->field(0x01);
+	if (!field)
+		return;
+
+	// The port's default value is NORM (1).  Programmatic digital values are
+	// folded through the port default on read, so a held input reads as SLEEP.
+	field->set_value(norm ? 0 : 1);
+}
+
+void herojr_state::reset_interface_state()
+{
+	m_u214->reset();
+	m_u215->reset();
+
 	m_u214_port_a = 0xff;
 	m_keypad_bridge_byte = 0xff;
 	m_u214_port_b = 0x00;
 	m_u214_control_a = 0;
 	m_u214_control_b = 0;
 	m_motion_detector_state = 0;
-	m_rtc_sqw_state = 0;
-	m_rtc_irq_state = 0;
-	m_acia_irq_state = 0;
 	m_speech_data = 0;
 	m_u215_port_b = 0;
 	m_u215_control_a = 0;
@@ -273,8 +304,6 @@ void herojr_state::machine_reset()
 	m_speech_power_state = 0;
 	m_speech_request = 1;
 	m_speech_strobe_state = 0;
-	m_rs232_status = 0;
-	m_rs232_data = 0;
 	m_drive_activity_count = 0;
 	m_speech_phoneme = 0;
 	m_speech_inflection = 0;
@@ -293,11 +322,29 @@ void herojr_state::machine_reset()
 	m_motion_detector = 0;
 	m_wheel_feedback = 0;
 	m_drive_activity = 0;
+	for (int port = 0; port < 8; port++)
+		m_port_outputs[port] = 0;
+	m_sonar_echo_timer->adjust(attotime::never);
+}
+
+void herojr_state::pulse_reset_line()
+{
+	m_maincpu->resume(SUSPEND_REASON_HALT);
+	reset_interface_state();
+	m_maincpu->pulse_input_line(INPUT_LINE_RESET, attotime::zero);
+}
+
+void herojr_state::machine_reset()
+{
+	reset_interface_state();
+	m_rtc_sqw_state = 0;
+	m_rtc_irq_state = 0;
+	m_acia_irq_state = 0;
+	m_rs232_status = 0;
+	m_rs232_data = 0;
 	m_rtc_sqw = 0;
 	m_rs232_status_output = 0;
 	m_rs232_data_output = 0;
-	for (int port = 0; port < 8; port++)
-		m_port_outputs[port] = 0;
 	// The monitor polls MC146818 register A through $D810/$D811 during boot
 	// and waits for UIP to clear.  Start from a valid divider/rate register
 	// instead of inheriting an erased NVRAM byte.
@@ -306,16 +353,21 @@ void herojr_state::machine_reset()
 	m_rtc->read_direct(0x0d);
 	update_irq_line();
 	m_rtc_square_wave_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
-	m_sonar_echo_timer->adjust(attotime::never);
 }
 
 INPUT_CHANGED_MEMBER(herojr_state::sleep_norm_changed)
 {
-	// The technical manual describes the RTC/reset circuit pulsing reset in
-	// sleep so the CPU can check wake sources.  Moving SW2 back to Norm is the
-	// user-visible wake source, so schedule the reset edge the ROM expects.
+	(void)oldval;
+	(void)newval;
+	// SW2 is read by firmware at $D841 D6.  The operator manual's warm path is
+	// explicit: place SW2 in NORM, then press RESET.  Do not turn the switch
+	// edge itself into a firmware reset.
+}
+
+INPUT_CHANGED_MEMBER(herojr_state::reset_changed)
+{
 	if (!oldval && newval)
-		machine().schedule_soft_reset();
+		pulse_reset_line();
 }
 
 void herojr_state::mem_map(address_map &map)
@@ -563,6 +615,7 @@ TIMER_CALLBACK_MEMBER(herojr_state::rtc_square_wave_tick)
 	m_rtc_irq_state = m_rtc_sqw_state;
 	update_u214_input_outputs();
 	update_irq_line();
+
 }
 
 u8 herojr_state::u215_speech_data_r()
@@ -779,9 +832,10 @@ static INPUT_PORTS_START(herojr)
 	PORT_ADJUSTER(48, "Sonar distance in inches")
 
 	PORT_START("SLEEP_NORM")
-	PORT_CONFNAME(0x01, 0x01, "Sleep/Norm") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(herojr_state::sleep_norm_changed), 0)
-	PORT_CONFSETTING(0x00, "Sleep")
-	PORT_CONFSETTING(0x01, "Norm")
+	PORT_BIT(0x01, 0x01, IPT_OTHER) PORT_NAME("Sleep/Norm") PORT_CODE(KEYCODE_F12) PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(herojr_state::sleep_norm_changed), 0)
+
+	PORT_START("RESET")
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("RESET") PORT_CODE(KEYCODE_BACKSPACE) PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(herojr_state::reset_changed), 0)
 INPUT_PORTS_END
 
 static DEVICE_INPUT_DEFAULTS_START(herojr_rs232)
