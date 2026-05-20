@@ -302,6 +302,26 @@ local function set_herojr_keypad_field(key, pressed)
     field:set_value(pressed and 1 or 0)
   end
 end
+
+local function set_herojr_sleep_norm_field(norm)
+  local system = manager.machine.system
+  if not system or system.name ~= "herojr" then
+    return false
+  end
+
+  local port = manager.machine.ioport.ports[":SLEEP_NORM"] or manager.machine.ioport.ports["SLEEP_NORM"]
+  if not port then
+    return false
+  end
+
+  local field = port:field(0x01)
+  if not field then
+    return false
+  end
+
+  field.user_value = norm and 1 or 0
+  return true
+end
 local subscriptions = {}
 local pending_step_reason = nil
 local pending_step_start_pc = nil
@@ -326,6 +346,8 @@ local supported_commands = {
   "set_sensor",
   "press_key",
   "release_key",
+  "set_sleep_norm",
+  "warm_start",
   "reset_machine"
 }
 
@@ -1340,6 +1362,42 @@ local function release_key(params)
   return {}
 end
 
+local function set_sleep_norm(params)
+  local norm = true
+  if params and params.norm ~= nil then
+    norm = params.norm and true or false
+  elseif params and params.sleep ~= nil then
+    norm = not params.sleep
+  end
+
+  if not set_herojr_sleep_norm_field(norm) then
+    error("set_sleep_norm requires HERO Jr SLEEP_NORM input")
+  end
+
+  broadcast_io_changed()
+  return { sleepNorm = norm and 1 or 0 }
+end
+
+local function warm_start()
+  if not set_herojr_sleep_norm_field(false) then
+    error("warm_start requires HERO Jr SLEEP_NORM input")
+  end
+
+  manager.machine:soft_reset()
+  emu.unpause()
+  cpu_debug():go()
+
+  if not set_herojr_sleep_norm_field(true) then
+    error("warm_start requires HERO Jr SLEEP_NORM input")
+  end
+
+  manager.machine:soft_reset()
+  emu.unpause()
+  cpu_debug():go()
+  broadcast_io_changed()
+  return { sleepNorm = 1, sequence = "sleep-norm-reset" }
+end
+
 local function reset_machine(params)
   local preserve_herojr_keys = system_name() == "herojr" and params and params.preserveKeys == true
   clear_temp_step_breakpoints()
@@ -1429,6 +1487,8 @@ local handlers = {
   set_sensor = set_sensor,
   press_key = press_key,
   release_key = release_key,
+  set_sleep_norm = set_sleep_norm,
+  warm_start = warm_start,
   reset_machine = reset_machine
 }
 

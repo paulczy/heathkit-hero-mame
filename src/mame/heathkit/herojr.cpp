@@ -72,6 +72,7 @@ public:
 	}
 
 	void herojr(machine_config &config) ATTR_COLD;
+	DECLARE_INPUT_CHANGED_MEMBER(sleep_norm_changed);
 
 protected:
 	virtual void machine_start() override ATTR_COLD;
@@ -81,7 +82,6 @@ private:
 	static constexpr u16 HEROJR_SENSOR_BASE = 0xd860; // bridge injection aperture, not original hardware
 
 	DECLARE_DEVICE_IMAGE_LOAD_MEMBER(cart_load);
-
 	void mem_map(address_map &map) ATTR_COLD;
 	u8 sensor_debug_r(offs_t offset);
 	void sensor_debug_w(offs_t offset, u8 data);
@@ -307,6 +307,15 @@ void herojr_state::machine_reset()
 	update_irq_line();
 	m_rtc_square_wave_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
 	m_sonar_echo_timer->adjust(attotime::never);
+}
+
+INPUT_CHANGED_MEMBER(herojr_state::sleep_norm_changed)
+{
+	// The technical manual describes the RTC/reset circuit pulsing reset in
+	// sleep so the CPU can check wake sources.  Moving SW2 back to Norm is the
+	// user-visible wake source, so schedule the reset edge the ROM expects.
+	if (!oldval && newval)
+		machine().schedule_soft_reset();
 }
 
 void herojr_state::mem_map(address_map &map)
@@ -770,7 +779,7 @@ static INPUT_PORTS_START(herojr)
 	PORT_ADJUSTER(48, "Sonar distance in inches")
 
 	PORT_START("SLEEP_NORM")
-	PORT_CONFNAME(0x01, 0x01, "Sleep/Norm")
+	PORT_CONFNAME(0x01, 0x01, "Sleep/Norm") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(herojr_state::sleep_norm_changed), 0)
 	PORT_CONFSETTING(0x00, "Sleep")
 	PORT_CONFSETTING(0x01, "Norm")
 INPUT_PORTS_END
