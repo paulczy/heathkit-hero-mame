@@ -314,6 +314,7 @@ void herojr_state::reset_interface_state()
 	m_adc_output = 0;
 	m_sonar_echo = 0;
 	m_sonar_distance_output = m_sonar_distance_sample;
+	m_votrax->reset();
 	update_speech_power();
 	m_motor_left = 0;
 	m_motor_right = 0;
