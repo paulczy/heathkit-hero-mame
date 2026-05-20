@@ -893,6 +893,8 @@ local function get_io_state()
   local herojr_d821 = prefix == "herojr" and read_u8(0xd821) or 0
   local herojr_d822 = prefix == "herojr" and read_u8(0xd822) or 0
   local herojr_d823 = prefix == "herojr" and read_u8(0xd823) or 0
+  local herojr_d841 = prefix == "herojr" and read_u8(0xd841) or 0
+  local herojr_d842 = prefix == "herojr" and read_u8(0xd842) or 0
   local herojr_d843 = prefix == "herojr" and read_u8(0xd843) or 0
   local herojr_motion_detector = output_value(prefix .. "_motion_detector")
   local herojr_wheel_feedback = output_value(prefix .. "_wheel_feedback")
@@ -1017,8 +1019,8 @@ local function get_io_state()
         d822 = herojr_d822,
         d823 = herojr_d823,
         d840 = dataLeds,
-        d841 = herojr_control,
-        d842 = output_value(speech_prefix .. "ready"),
+        d841 = herojr_d841,
+        d842 = herojr_d842,
         d843 = herojr_d843,
         d880 = herojr_rs232_status,
         d881 = rs232_data
@@ -1063,6 +1065,7 @@ local function get_io_state()
       sense = {
         control = herojr_control,
         sensePower = sense_power,
+        sleepNorm = (herojr_d841 >> 6) & 0x01,
         soundLightSelect = (herojr_control >> 2) & 0x01,
         adcChipSelect = (herojr_control >> 3) & 0x01,
         adcOutput = herojr_adc_output,
@@ -1442,10 +1445,13 @@ local function handle_request(client, line)
     return
   end
 
+  trace("request #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " pc=" .. trace_address(get_register("pc")))
   local success, result = pcall(handler, request.params or {})
   if success then
+    trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " ok")
     send_line(client, { id = request.id, ok = true, result = result or {} })
   else
+    trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " failed: " .. tostring(result))
     send_line(client, { id = request.id, ok = false, error = tostring(result) })
   end
 end

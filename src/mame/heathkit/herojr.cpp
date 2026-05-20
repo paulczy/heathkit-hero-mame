@@ -47,6 +47,7 @@ public:
 		m_light_level(*this, "LIGHT"),
 		m_sound_level(*this, "SOUND"),
 		m_sonar_distance(*this, "SONAR"),
+		m_sleep_norm(*this, "SLEEP_NORM"),
 		m_speech_phoneme(*this, "herojr_speech_phoneme"),
 		m_speech_inflection(*this, "herojr_speech_inflection"),
 		m_speech_strobe(*this, "herojr_speech_strobe"),
@@ -134,6 +135,7 @@ private:
 	required_ioport m_light_level;
 	required_ioport m_sound_level;
 	required_ioport m_sonar_distance;
+	required_ioport m_sleep_norm;
 
 	output_finder<> m_speech_phoneme;
 	output_finder<> m_speech_inflection;
@@ -167,6 +169,7 @@ private:
 	u8 m_acia_irq_state = 0;
 	u8 m_speech_data = 0;
 	u8 m_u215_port_b = 0;
+	u8 m_u215_control_a = 0;
 	u8 m_u215_control_b = 0;
 	u8 m_adc_shift = 0;
 	u8 m_adc_bits_remaining = 0;
@@ -221,6 +224,7 @@ void herojr_state::machine_start()
 	save_item(NAME(m_acia_irq_state));
 	save_item(NAME(m_speech_data));
 	save_item(NAME(m_u215_port_b));
+	save_item(NAME(m_u215_control_a));
 	save_item(NAME(m_u215_control_b));
 	save_item(NAME(m_adc_shift));
 	save_item(NAME(m_adc_bits_remaining));
@@ -255,6 +259,7 @@ void herojr_state::machine_reset()
 	m_acia_irq_state = 0;
 	m_speech_data = 0;
 	m_u215_port_b = 0;
+	m_u215_control_a = 0;
 	m_u215_control_b = 0;
 	m_adc_shift = 0;
 	m_adc_bits_remaining = 0;
@@ -558,12 +563,12 @@ u8 herojr_state::u215_speech_data_r()
 
 u8 herojr_state::u215_speech_power_r()
 {
-	return (m_u215_port_b & 0xef) | (m_adc_output_state ? 0x10 : 0x00);
+	return (m_u215_port_b & 0xaf) | (m_adc_output_state ? 0x10 : 0x00) | (m_sleep_norm->read() ? 0x40 : 0x00);
 }
 
 u8 herojr_state::u215_speech_control_r()
 {
-	return (m_speech_request ? 0x01 : 0x00) | (m_speech_strobe_state ? 0x02 : 0x00);
+	return (m_u215_control_a & 0x3f) | (m_speech_request ? 0x80 : 0x00);
 }
 
 u8 herojr_state::u215_sonar_echo_r()
@@ -601,8 +606,9 @@ void herojr_state::u215_speech_power_w(u8 data)
 void herojr_state::u215_speech_control_w(u8 data)
 {
 	m_port_outputs[2] = data;
+	m_u215_control_a = data & 0x3f;
 	const u8 previous_strobe = m_speech_strobe_state;
-	m_speech_strobe_state = BIT(data, 0) ? 1 : 0;
+	m_speech_strobe_state = BIT(data, 3) ? 1 : 0;
 	m_speech_strobe = m_speech_strobe_state;
 	if (!previous_strobe && m_speech_strobe_state)
 		latch_speech_phoneme();
@@ -762,6 +768,11 @@ static INPUT_PORTS_START(herojr)
 
 	PORT_START("SONAR")
 	PORT_ADJUSTER(48, "Sonar distance in inches")
+
+	PORT_START("SLEEP_NORM")
+	PORT_CONFNAME(0x01, 0x01, "Sleep/Norm")
+	PORT_CONFSETTING(0x00, "Sleep")
+	PORT_CONFSETTING(0x01, "Norm")
 INPUT_PORTS_END
 
 static DEVICE_INPUT_DEFAULTS_START(herojr_rs232)
