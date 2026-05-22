@@ -1326,11 +1326,10 @@ local function set_sensor(params)
     end
   elseif name == "motionDetected" then
     if system_name() == "herojr" then
-      local port_b = read_u8(0xd821)
       if params.value then
-        write_u8(0xd821, port_b | 0x80)
+        write_u8(herojr_sensor_base + 0x03, 1)
       else
-        write_u8(0xd821, port_b & 0x7f)
+        write_u8(herojr_sensor_base + 0x03, 0)
       end
     else
       write_u8(sensor_base + 0x03, params.value and 1 or 0)

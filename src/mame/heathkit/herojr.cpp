@@ -116,6 +116,8 @@ private:
 	void set_speech_data(u8 data);
 	void latch_speech_phoneme();
 	bool drive_feedback_active() const;
+	void advance_wheel_feedback_sample();
+	void update_drive_sonar_motion();
 	u8 selected_adc_sample() const;
 	void start_adc_conversion();
 	void clock_adc_bit();
@@ -397,7 +399,7 @@ void herojr_state::mem_map(address_map &map)
 	map(0xd841, 0xd841).rw(FUNC(herojr_state::u215_speech_power_r), FUNC(herojr_state::u215_speech_power_w));
 	map(0xd842, 0xd842).rw(FUNC(herojr_state::u215_speech_control_r), FUNC(herojr_state::u215_speech_control_w));
 	map(0xd843, 0xd843).rw(FUNC(herojr_state::u215_sonar_echo_r), FUNC(herojr_state::u215_sonar_echo_w));
-	map(HEROJR_SENSOR_BASE + 0x00, HEROJR_SENSOR_BASE + 0x02).rw(FUNC(herojr_state::sensor_debug_r), FUNC(herojr_state::sensor_debug_w));
+	map(HEROJR_SENSOR_BASE + 0x00, HEROJR_SENSOR_BASE + 0x03).rw(FUNC(herojr_state::sensor_debug_r), FUNC(herojr_state::sensor_debug_w));
 	map(0xd880, 0xdfff).rw(FUNC(herojr_state::rs232_r), FUNC(herojr_state::rs232_w));
 
 	map(0x8000, 0xd7ff).rom().region("maincpu", 0);
@@ -411,6 +413,7 @@ u8 herojr_state::sensor_debug_r(offs_t offset)
 	case 0x00: return m_light_sample;
 	case 0x01: return m_sound_sample;
 	case 0x02: return m_sonar_distance_sample;
+	case 0x03: return m_motion_detector_state;
 	default: return 0;
 	}
 }
@@ -429,6 +432,10 @@ void herojr_state::sensor_debug_w(offs_t offset, u8 data)
 		m_sonar_distance_sample = data;
 		m_sonar_distance_output = data;
 		break;
+	case 0x03:
+		m_motion_detector_state = BIT(data, 0) ? 1 : 0;
+		m_motion_detector = m_motion_detector_state;
+		break;
 	}
 }
 
@@ -440,6 +447,8 @@ u8 herojr_state::rtc_r(offs_t offset)
 		const u8 data = m_rtc->data_r();
 		if (address == 0x0a && data == 0xff)
 			return 0x26;
+		if (address == 0x0a)
+			return data & 0x7f;
 		if (address == 0x0d && data == 0xff)
 			return 0x80;
 		return data;
@@ -484,9 +493,8 @@ u8 herojr_state::keypad_matrix_r()
 
 	if (drive_feedback_active() || m_wheel_feedback_port_a_count != 0)
 	{
-		m_wheel_feedback_sample ^= 1;
-		m_wheel_feedback = m_wheel_feedback_sample;
-		data = (data & ~0xc0) | (m_wheel_feedback_sample ? 0xc0 : 0x00);
+		advance_wheel_feedback_sample();
+		data = (data & ~0xc0) | ((m_wheel_feedback_sample & 0x03) << 6);
 		if (!drive_feedback_active() && m_u214_port_a == 0xff)
 			m_wheel_feedback_port_a_count--;
 	}
@@ -523,12 +531,29 @@ bool herojr_state::is_keypad_bridge_release(u8 data)
 
 u8 herojr_state::u214_port_b_r()
 {
-	return (m_u214_port_b & 0x7f) | (m_motion_detector_state ? 0x80 : 0x00);
+	return (m_u214_port_b & 0x7f) | (m_motion_detector_state ? 0x00 : 0x80);
 }
 
 bool herojr_state::drive_feedback_active() const
 {
 	return (m_u214_port_b & 0x3e) != 0;
+}
+
+void herojr_state::advance_wheel_feedback_sample()
+{
+	m_wheel_feedback_sample = (m_wheel_feedback_sample + 1) & 0x03;
+	m_wheel_feedback = m_wheel_feedback_sample;
+}
+
+void herojr_state::update_drive_sonar_motion()
+{
+	if (!BIT(m_u214_port_b, 1) || (m_u214_port_b & 0x3f) == 0x3f)
+		return;
+
+	m_sonar_distance_sample = BIT(m_u214_port_b, 0)
+		? std::min<u8>(96, m_sonar_distance_sample + 1)
+		: std::max<u8>(1, m_sonar_distance_sample - 1);
+	m_sonar_distance_output = m_sonar_distance_sample;
 }
 
 void herojr_state::u214_port_a_w(u8 data)
@@ -555,8 +580,8 @@ void herojr_state::u214_port_b_w(u8 data)
 		m_drive_activity_count++;
 		m_drive_activity = m_drive_activity_count;
 		m_wheel_feedback_port_a_count = 2048;
+		advance_wheel_feedback_sample();
 	}
-	m_motion_detector_state = BIT(data, 7) ? 1 : 0;
 	// HERO Jr Technical Manual: $D821 D1 controls main drive motor A2,
 	// D0 controls relay RY301 for direction, and D2-D5 drive steering phases.
 	m_motor_left = BIT(data, 1) ? 1 : 0;
@@ -574,11 +599,11 @@ u8 herojr_state::u214_control_a_r()
 u8 herojr_state::u214_control_b_r()
 {
 	if (drive_feedback_active() || m_wheel_feedback_port_a_count != 0)
-		m_wheel_feedback_sample ^= 1;
+		advance_wheel_feedback_sample();
 	else
 		m_wheel_feedback_sample = 0;
 	m_wheel_feedback = m_wheel_feedback_sample;
-	return (m_u214_control_b & 0x3f) | (m_wheel_feedback_sample ? 0x80 : 0x00);
+	return (m_u214_control_b & 0x3f) | (BIT(m_wheel_feedback_sample, 0) ? 0x80 : 0x00);
 }
 
 void herojr_state::u214_control_a_w(u8 data)
@@ -614,6 +639,13 @@ TIMER_CALLBACK_MEMBER(herojr_state::rtc_square_wave_tick)
 {
 	m_rtc_sqw_state ^= 1;
 	m_rtc_irq_state = m_rtc_sqw_state;
+	if (drive_feedback_active() || m_wheel_feedback_port_a_count != 0)
+	{
+		advance_wheel_feedback_sample();
+		if (!drive_feedback_active() && m_wheel_feedback_port_a_count != 0)
+			m_wheel_feedback_port_a_count--;
+	}
+	update_drive_sonar_motion();
 	update_u214_input_outputs();
 	update_irq_line();
 
@@ -766,13 +798,13 @@ void herojr_state::clock_adc_bit()
 void herojr_state::schedule_sonar_echo()
 {
 	const u8 distance = m_sonar_distance_sample;
-	m_sonar_echo_state = 1;
-	m_sonar_echo = 1;
+	m_sonar_echo_state = 0;
+	m_sonar_echo = 0;
 	m_sonar_distance_output = distance;
 
 	// The real U307/U308 path measures elapsed echo time.  Keep a deterministic
 	// round-trip scale for firmware polling without claiming calibrated motion.
-	m_sonar_echo_timer->adjust(attotime::never);
+	m_sonar_echo_timer->adjust(attotime::from_usec(std::max<u32>(1, distance) * 150));
 }
 
 void herojr_state::update_speech_power()
