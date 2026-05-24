@@ -34,10 +34,26 @@
 #include "bus/rs232/rs232.h"
 #include "sound/votrax.h"
 
+#include "osdcore.h"
 #include "speaker.h"
+
+#include <cstring>
+#include <utility>
 
 
 namespace {
+
+bool driver_trace_enabled(const char *system)
+{
+	const char *const value = osd_getenv("HEATHKIT_HERO_DRIVER_TRACE");
+	if (!value || !*value)
+		return false;
+
+	return !std::strcmp(value, "1")
+		|| !std::strcmp(value, "true")
+		|| !std::strcmp(value, "all")
+		|| std::strstr(value, system) != nullptr;
+}
 
 class hero1_state : public driver_device
 {
@@ -141,6 +157,17 @@ private:
 	TIMER_CALLBACK_MEMBER(executive_timer_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 
+	template <typename... FormatParams>
+	void driver_tracef(const char *format, FormatParams &&... args)
+	{
+		if (!m_driver_trace)
+			return;
+
+		osd_printf_info("heathkit_hero_driver[hero1]: ");
+		osd_printf_info(format, std::forward<FormatParams>(args)...);
+		osd_printf_info("\n");
+	}
+
 	required_device<m6808_cpu_device> m_maincpu;
 	required_device<pia6821_device> m_display_pia;
 	required_device<pia6821_device> m_keypad_pia;
@@ -191,12 +218,14 @@ private:
 	u8 m_pendant_port = 0x8e;  // ET-18 teaching pendant read byte at $C280; idle ARM/N/released
 	u8 m_experimental_serial_rxd = 1;
 	u8 m_drive_feedback_sample = 0;
+	bool m_driver_trace = false;
 	emu_timer *m_executive_timer = nullptr;
 	emu_timer *m_sonar_timer = nullptr;
 };
 
 void hero1_state::machine_start()
 {
+	m_driver_trace = driver_trace_enabled("hero1");
 	m_digits.resolve();
 	m_motor_left.resolve();
 	m_motor_right.resolve();
@@ -238,6 +267,7 @@ void hero1_state::machine_start()
 
 	m_executive_timer = timer_alloc(FUNC(hero1_state::executive_timer_tick), this);
 	m_sonar_timer = timer_alloc(FUNC(hero1_state::sonar_echo_tick), this);
+	driver_tracef("machine_start trace enabled");
 }
 
 void hero1_state::machine_reset()
@@ -269,6 +299,7 @@ void hero1_state::machine_reset()
 	m_drive_feedback_sample = 0;
 	m_rs232->write_txd(1);
 	m_speech_phoneme = 0;
+	driver_tracef("machine_reset pendant=$%02X speech_request=%u speech_power=%u", m_pendant_port, m_speech_request, m_speech_power);
 	m_speech_inflection = 0;
 	m_speech_strobe = 0;
 	m_speech_ready = 1;
@@ -580,6 +611,7 @@ void hero1_state::port_c200_control_w(u8 data)
 {
 	m_manual_port_out[0] = data;
 	m_port_outputs[0] = data;
+	driver_tracef("port_c200_control_w data=$%02X interrupt_before=$%02X", data, m_interrupt_status);
 	// CPU-board output latch U411 clears selected interrupt-status flip-flops
 	// when a bit is written high.
 	m_interrupt_status &= ~data;
@@ -597,6 +629,7 @@ void hero1_state::port_c240_speech_w(u8 data)
 {
 	m_manual_port_out[2] = data;
 	m_port_outputs[2] = data;
+	driver_tracef("port_c240_speech_w data=$%02X phoneme=$%02X inflection=%u", data, data & 0x3f, (data >> 6) & 0x03);
 
 	// ET-18 Technical Manual: C240 carries the speech synthesizer's six-bit
 	// phoneme address plus two pitch/inflection control bits.
@@ -623,8 +656,11 @@ void hero1_state::port_c2a0_main_drive_w(u8 data)
 {
 	m_manual_port_out[5] = data;
 	m_port_outputs[5] = data;
-	m_motor_left = BIT(data, 0) ? 1 : 0;
-	m_motor_right = BIT(data, 1) ? 1 : 0;
+	const u8 left = BIT(data, 0) ? 1 : 0;
+	const u8 right = BIT(data, 1) ? 1 : 0;
+	m_motor_left = left;
+	m_motor_right = right;
+	driver_tracef("port_c2a0_main_drive_w data=$%02X left=%u right=%u", data, left, right);
 	reassert_level_interrupts();
 }
 
@@ -638,6 +674,7 @@ void hero1_state::port_c2c0_select_strobe_w(u8 data)
 	const u8 previous_strobe = m_speech_strobe_state;
 	m_speech_strobe_state = BIT(data, 5) ? 1 : 0;
 	m_speech_strobe = m_speech_strobe_state;
+	driver_tracef("port_c2c0_select_strobe_w data=$%02X clock_address=$%01X strobe=%u previous_strobe=%u", data, m_clock_address, m_speech_strobe_state, previous_strobe);
 	if (!previous_strobe && m_speech_strobe_state)
 		latch_speech_phoneme();
 	reassert_level_interrupts();
@@ -651,6 +688,7 @@ void hero1_state::port_c2e0_system_select_w(u8 data)
 	const u8 previous_speech_power = m_speech_power;
 	m_speech_power = BIT(data, 3) ? 1 : 0;
 	update_speech_power();
+	driver_tracef("port_c2e0_system_select_w data=$%02X sonar_power=%u previous_sonar_power=%u speech_power=%u previous_speech_power=%u", data, BIT(data, 1), previous_sonar_power, m_speech_power, previous_speech_power);
 	if (previous_speech_power && !m_speech_power)
 	{
 		m_votrax->reset();
@@ -671,6 +709,7 @@ void hero1_state::port_c2e0_system_select_w(u8 data)
 void hero1_state::port_c300_clock_w(u8 data)
 {
 	m_clock_control = data;
+	driver_tracef("port_c300_clock_w data=$%02X address=$%01X hold=%u read=%u write=%u cs=%u", data, m_clock_address, BIT(data, 4), BIT(data, 5), BIT(data, 6), BIT(data, 7));
 	m_rtc->data_w(data & 0x0f);
 	m_rtc->hold_w(BIT(data, 4));
 	m_rtc->read_w(BIT(data, 5));
@@ -712,6 +751,7 @@ void hero1_state::speech_request_w(int state)
 {
 	m_speech_request = state ? 1 : 0;
 	m_speech_ready = m_speech_request;
+	driver_tracef("speech_request_w state=%d ready=%u", state, m_speech_request);
 }
 
 void hero1_state::set_speech_data(u8 data)

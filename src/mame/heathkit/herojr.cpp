@@ -28,9 +28,22 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 
 namespace {
+
+bool driver_trace_enabled(const char *system)
+{
+	const char *const value = osd_getenv("HEATHKIT_HERO_DRIVER_TRACE");
+	if (!value || !*value)
+		return false;
+
+	return !std::strcmp(value, "1")
+		|| !std::strcmp(value, "true")
+		|| !std::strcmp(value, "all")
+		|| std::strstr(value, system) != nullptr;
+}
 
 class herojr_state : public driver_device
 {
@@ -134,6 +147,17 @@ private:
 	TIMER_CALLBACK_MEMBER(rtc_square_wave_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 
+	template <typename... FormatParams>
+	void driver_tracef(const char *format, FormatParams &&... args)
+	{
+		if (!m_driver_trace)
+			return;
+
+		osd_printf_info("heathkit_hero_driver[herojr]: ");
+		osd_printf_info(format, std::forward<FormatParams>(args)...);
+		osd_printf_info("\n");
+	}
+
 	required_device<m6808_cpu_device> m_maincpu;
 	required_device<generic_slot_device> m_cart;
 	required_device<mc146818_device> m_rtc;
@@ -200,6 +224,7 @@ private:
 	u8 m_rs232_status = 0;
 	u8 m_rs232_data = 0;
 	u32 m_drive_activity_count = 0;
+	bool m_driver_trace = false;
 	emu_timer *m_speech_strobe_clear_timer = nullptr;
 	emu_timer *m_speech_request_fallback_timer = nullptr;
 	emu_timer *m_rtc_square_wave_timer = nullptr;
@@ -209,6 +234,7 @@ private:
 
 void herojr_state::machine_start()
 {
+	m_driver_trace = driver_trace_enabled("herojr");
 	m_speech_phoneme.resolve();
 	m_speech_inflection.resolve();
 	m_speech_strobe.resolve();
@@ -234,6 +260,7 @@ void herojr_state::machine_start()
 	const char *const initial_sleep = osd_getenv("HEATHKIT_HEROJR_INITIAL_SLEEP");
 	if (initial_sleep && !std::strcmp(initial_sleep, "1"))
 		set_sleep_norm_input(false);
+	driver_tracef("machine_start trace enabled initial_sleep=%s", initial_sleep ? initial_sleep : "");
 
 	save_item(NAME(m_u214_port_a));
 	save_item(NAME(m_keypad_bridge_byte));
@@ -377,12 +404,12 @@ void herojr_state::machine_reset()
 	m_rtc->write_direct(0x0b, 0x02);
 	update_irq_line();
 	m_rtc_square_wave_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
+	driver_tracef("machine_reset sleep_norm=%u speech_request=%u rtc_sqw=%u", m_sleep_norm->read(), m_speech_request, m_rtc_sqw_state);
 }
 
 INPUT_CHANGED_MEMBER(herojr_state::sleep_norm_changed)
 {
-	(void)oldval;
-	(void)newval;
+	driver_tracef("sleep_norm_changed old=%d new=%d", oldval, newval);
 	// SW2 is read by firmware at $D841 D6.  The operator manual's warm path is
 	// explicit: place SW2 in NORM, then press RESET.  Do not turn the switch
 	// edge itself into a firmware reset.
@@ -390,6 +417,7 @@ INPUT_CHANGED_MEMBER(herojr_state::sleep_norm_changed)
 
 INPUT_CHANGED_MEMBER(herojr_state::reset_changed)
 {
+	driver_tracef("reset_changed old=%d new=%d", oldval, newval);
 	if (oldval != newval)
 		set_reset_line(newval != 0);
 }
@@ -480,6 +508,7 @@ u8 herojr_state::rtc_r(offs_t offset)
 
 void herojr_state::rtc_w(offs_t offset, u8 data)
 {
+	driver_tracef("rtc_w offset=$%X data=$%02X register_select=%u", unsigned(offset & 0x0f), data, BIT(offset, 0));
 	if (BIT(offset, 0))
 		m_rtc->data_w(data);
 	else
@@ -488,7 +517,9 @@ void herojr_state::rtc_w(offs_t offset, u8 data)
 
 u8 herojr_state::u214_port_a_r()
 {
-	return keypad_matrix_r();
+	const u8 data = keypad_matrix_r();
+	driver_tracef("u214_port_a_r data=$%02X port_a=$%02X keypad_bridge=$%02X wheel_feedback=%u feedback_count=%u", data, m_u214_port_a, m_keypad_bridge_byte, m_wheel_feedback_sample, m_wheel_feedback_port_a_count);
+	return data;
 }
 
 u8 herojr_state::keypad_matrix_r()
@@ -567,6 +598,7 @@ void herojr_state::advance_wheel_feedback_sample()
 {
 	m_wheel_feedback_sample = (m_wheel_feedback_sample + 1) & 0x03;
 	m_wheel_feedback = m_wheel_feedback_sample;
+	driver_tracef("advance_wheel_feedback_sample sample=%u active=%u feedback_count=%u port_b=$%02X", m_wheel_feedback_sample, drive_feedback_active() ? 1 : 0, m_wheel_feedback_port_a_count, m_u214_port_b);
 }
 
 void herojr_state::update_drive_sonar_motion()
@@ -612,6 +644,7 @@ void herojr_state::u214_port_b_w(u8 data)
 	m_motor_right = BIT(data, 0) ? 1 : 0;
 	m_port_outputs[3] = (data & 0x3c) << 2;
 	m_port_outputs[5] = (BIT(data, 1) ? 0x40 : 0x00) | (BIT(data, 0) ? 0x80 : 0x00);
+	driver_tracef("u214_port_b_w data=$%02X latched=$%02X drive_activity=%u wheel_feedback=%u feedback_count=%u", data, m_u214_port_b, m_drive_activity_count, m_wheel_feedback_sample, m_wheel_feedback_port_a_count);
 	update_u214_input_outputs();
 }
 
@@ -707,6 +740,8 @@ u8 herojr_state::u215_sonar_echo_r()
 
 void herojr_state::u215_speech_data_w(u8 data)
 {
+	const bool data_register_selected = BIT(m_u215_control_a, 2);
+	driver_tracef("u215_speech_data_w data=$%02X data_register=%u control_a=$%02X ddr_a=$%02X", data, data_register_selected ? 1 : 0, m_u215_control_a, m_u215_ddr_a);
 	if (!BIT(m_u215_control_a, 2))
 	{
 		m_u215_ddr_a = data;
@@ -743,11 +778,13 @@ void herojr_state::u215_speech_power_w(u8 data)
 void herojr_state::u215_speech_control_w(u8 data)
 {
 	m_port_outputs[2] = data;
+	const u8 previous_control = m_u215_control_a;
 	m_u215_control_a = data & 0x3f;
 	const u8 previous_strobe = m_speech_strobe_state;
 	const u8 requested_strobe = BIT(data, 3) ? 1 : 0;
 	m_speech_strobe_state = requested_strobe;
 	m_speech_strobe = m_speech_strobe_state;
+	driver_tracef("u215_speech_control_w data=$%02X previous_control=$%02X control_a=$%02X strobe=%u previous_strobe=%u request_flag=%u", data, previous_control, m_u215_control_a, requested_strobe, previous_strobe, m_speech_request_flag);
 	if (!requested_strobe)
 	{
 		m_speech_strobe_clear_timer->adjust(attotime::never);
@@ -777,6 +814,7 @@ u8 herojr_state::rs232_r(offs_t offset)
 
 void herojr_state::rs232_w(offs_t offset, u8 data)
 {
+	driver_tracef("rs232_w offset=$%X data=$%02X target=%s", unsigned(offset & 0x01), data, BIT(offset, 0) ? "data" : "control");
 	if (BIT(offset, 0))
 	{
 		m_rs232_data = data;
@@ -796,6 +834,7 @@ void herojr_state::speech_request_w(int state)
 	const u8 previous_request = m_speech_request;
 	m_speech_request = state ? 1 : 0;
 	m_speech_ready = m_speech_request;
+	driver_tracef("speech_request_w state=%d previous=%u request=%u flag=%u control_a=$%02X", state, previous_request, m_speech_request, m_speech_request_flag, m_u215_control_a);
 	if (!previous_request && m_speech_request)
 	{
 		m_speech_request_flag = 1;
@@ -884,6 +923,7 @@ void herojr_state::schedule_sonar_echo()
 	m_sonar_echo_state = 0;
 	m_sonar_echo = 0;
 	m_sonar_distance_output = distance;
+	driver_tracef("schedule_sonar_echo distance=%u control_b=$%02X port_b=$%02X", distance, m_u214_control_b, m_u214_port_b);
 
 	// The real U307/U308 path measures elapsed echo time.  Keep a deterministic
 	// round-trip scale for firmware polling without claiming calibrated motion.

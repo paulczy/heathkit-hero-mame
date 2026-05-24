@@ -603,6 +603,18 @@ local function encode_json(value)
   error("cannot encode JSON value of type " .. value_type)
 end
 
+local function diagnostic_event(scope, message, details)
+  if not trace_enabled("diagnostic") then
+    return
+  end
+
+  emu.print_info("HERO_DIAGNOSTIC " .. encode_json({
+    scope = scope,
+    message = message,
+    details = details or {}
+  }))
+end
+
 local function decode_json(text)
   local pos = 1
 
@@ -1478,6 +1490,43 @@ local function state_file_name(params, command)
   return file
 end
 
+local function snapshot_address_map(addresses)
+  local values = {}
+  for addr, _ in pairs(addresses) do
+    values[#values + 1] = trace_address(addr)
+  end
+  table.sort(values)
+  return values
+end
+
+local function bridge_debug_snapshot()
+  local snapshot = {
+    system = system_name(),
+    profile = profile_name(),
+    pc = trace_address(get_register("pc")),
+    debugger_state = manager.machine.debugger and manager.machine.debugger.execution_state or "unknown",
+    active_breakpoints = snapshot_address_map(breakpoints_by_addr),
+    active_read_watchpoints = snapshot_address_map(read_watchpoints_by_addr),
+    last_stop_pc = last_stop_pc and trace_address(last_stop_pc) or nil
+  }
+
+  local registers_ok, registers = pcall(get_registers)
+  if registers_ok then
+    snapshot.registers = registers
+  else
+    snapshot.registers = { error = tostring(registers) }
+  end
+
+  local io_ok, io = pcall(get_io_state)
+  if io_ok then
+    snapshot.io = io
+  else
+    snapshot.io = { error = tostring(io) }
+  end
+
+  return snapshot
+end
+
 local function save_state(params)
   local file = state_file_name(params, "save_state")
   trace("state", "save_state requesting file=" .. file .. " pc=" .. trace_address(get_register("pc")))
@@ -1486,6 +1535,11 @@ local function save_state(params)
   if not ok then
     error(result)
   end
+  diagnostic_event("mame:lua:state", "MAME save state completed.", {
+    file = file,
+    result = tostring(result),
+    snapshot = bridge_debug_snapshot()
+  })
   emu.unpause()
   cpu_debug():go()
   return { file = file }
@@ -1499,6 +1553,11 @@ local function load_state(params)
   if not ok then
     error(result)
   end
+  diagnostic_event("mame:lua:state", "MAME load state completed.", {
+    file = file,
+    result = tostring(result),
+    snapshot = bridge_debug_snapshot()
+  })
   emu.unpause()
   cpu_debug():go()
   return { file = file }
@@ -1658,6 +1717,12 @@ local function handle_request(client, line)
     send_line(client, { id = request.id, ok = true, result = result or {} })
   else
     trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " failed: " .. tostring(result))
+    diagnostic_event("mame:lua:rpc-error", "Lua bridge request failed.", {
+      id = request.id,
+      cmd = request.cmd,
+      error = tostring(result),
+      snapshot = bridge_debug_snapshot()
+    })
     send_line(client, { id = request.id, ok = false, error = tostring(result) })
   end
 end
