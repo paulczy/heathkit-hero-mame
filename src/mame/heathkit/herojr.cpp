@@ -54,6 +54,7 @@ public:
 		m_speech_inflection(*this, "herojr_speech_inflection"),
 		m_speech_strobe(*this, "herojr_speech_strobe"),
 		m_speech_ready(*this, "herojr_speech_ready"),
+		m_speech_request_flag_output(*this, "herojr_speech_request_flag"),
 		m_speech_power(*this, "herojr_speech_power"),
 		m_adc_sample(*this, "herojr_adc_sample"),
 		m_adc_output(*this, "herojr_adc_output"),
@@ -127,7 +128,9 @@ private:
 	void update_speech_power();
 	void set_sleep_norm_input(bool norm);
 	void reset_interface_state();
-	void pulse_reset_line();
+	void set_reset_line(bool asserted);
+	TIMER_CALLBACK_MEMBER(speech_strobe_clear);
+	TIMER_CALLBACK_MEMBER(speech_request_fallback);
 	TIMER_CALLBACK_MEMBER(rtc_square_wave_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 
@@ -149,6 +152,7 @@ private:
 	output_finder<> m_speech_inflection;
 	output_finder<> m_speech_strobe;
 	output_finder<> m_speech_ready;
+	output_finder<> m_speech_request_flag_output;
 	output_finder<> m_speech_power;
 	output_finder<> m_adc_sample;
 	output_finder<> m_adc_output;
@@ -176,6 +180,7 @@ private:
 	u8 m_rtc_irq_state = 0;
 	u8 m_acia_irq_state = 0;
 	u8 m_speech_data = 0;
+	u8 m_u215_ddr_a = 0;
 	u8 m_u215_port_b = 0;
 	u8 m_u215_control_a = 0;
 	u8 m_u215_control_b = 0;
@@ -190,10 +195,13 @@ private:
 	u8 m_sonar_distance_sample = 48;
 	u8 m_speech_power_state = 0;
 	u8 m_speech_request = 1;
+	u8 m_speech_request_flag = 0;
 	u8 m_speech_strobe_state = 0;
 	u8 m_rs232_status = 0;
 	u8 m_rs232_data = 0;
 	u32 m_drive_activity_count = 0;
+	emu_timer *m_speech_strobe_clear_timer = nullptr;
+	emu_timer *m_speech_request_fallback_timer = nullptr;
 	emu_timer *m_rtc_square_wave_timer = nullptr;
 	emu_timer *m_sonar_echo_timer = nullptr;
 	memory_passthrough_handler m_sleep_loop_tap;
@@ -205,6 +213,7 @@ void herojr_state::machine_start()
 	m_speech_inflection.resolve();
 	m_speech_strobe.resolve();
 	m_speech_ready.resolve();
+	m_speech_request_flag_output.resolve();
 	m_speech_power.resolve();
 	m_adc_sample.resolve();
 	m_adc_output.resolve();
@@ -236,6 +245,7 @@ void herojr_state::machine_start()
 	save_item(NAME(m_rtc_irq_state));
 	save_item(NAME(m_acia_irq_state));
 	save_item(NAME(m_speech_data));
+	save_item(NAME(m_u215_ddr_a));
 	save_item(NAME(m_u215_port_b));
 	save_item(NAME(m_u215_control_a));
 	save_item(NAME(m_u215_control_b));
@@ -250,11 +260,14 @@ void herojr_state::machine_start()
 	save_item(NAME(m_sonar_distance_sample));
 	save_item(NAME(m_speech_power_state));
 	save_item(NAME(m_speech_request));
+	save_item(NAME(m_speech_request_flag));
 	save_item(NAME(m_speech_strobe_state));
 	save_item(NAME(m_rs232_status));
 	save_item(NAME(m_rs232_data));
 	save_item(NAME(m_drive_activity_count));
 
+	m_speech_strobe_clear_timer = timer_alloc(FUNC(herojr_state::speech_strobe_clear), this);
+	m_speech_request_fallback_timer = timer_alloc(FUNC(herojr_state::speech_request_fallback), this);
 	m_rtc_square_wave_timer = timer_alloc(FUNC(herojr_state::rtc_square_wave_tick), this);
 	m_sonar_echo_timer = timer_alloc(FUNC(herojr_state::sonar_echo_tick), this);
 	m_sleep_loop_tap = m_maincpu->space(AS_PROGRAM).install_read_tap(
@@ -291,6 +304,7 @@ void herojr_state::reset_interface_state()
 	m_u214_control_b = 0;
 	m_motion_detector_state = 0;
 	m_speech_data = 0;
+	m_u215_ddr_a = 0;
 	m_u215_port_b = 0;
 	m_u215_control_a = 0;
 	m_u215_control_b = 0;
@@ -305,7 +319,11 @@ void herojr_state::reset_interface_state()
 	m_sonar_distance_sample = m_sonar_distance->read() & 0xff;
 	m_speech_power_state = 0;
 	m_speech_request = 1;
+	m_speech_request_flag = 0;
+	m_speech_request_flag_output = 0;
 	m_speech_strobe_state = 0;
+	m_speech_strobe_clear_timer->adjust(attotime::never);
+	m_speech_request_fallback_timer->adjust(attotime::never);
 	m_drive_activity_count = 0;
 	m_speech_phoneme = 0;
 	m_speech_inflection = 0;
@@ -330,11 +348,14 @@ void herojr_state::reset_interface_state()
 	m_sonar_echo_timer->adjust(attotime::never);
 }
 
-void herojr_state::pulse_reset_line()
+void herojr_state::set_reset_line(bool asserted)
 {
-	m_maincpu->resume(SUSPEND_REASON_HALT);
-	reset_interface_state();
-	m_maincpu->pulse_input_line(INPUT_LINE_RESET, attotime::zero);
+	if (asserted)
+	{
+		m_maincpu->resume(SUSPEND_REASON_HALT);
+		reset_interface_state();
+	}
+	m_maincpu->set_input_line(INPUT_LINE_RESET, asserted ? ASSERT_LINE : CLEAR_LINE);
 }
 
 void herojr_state::machine_reset()
@@ -349,11 +370,11 @@ void herojr_state::machine_reset()
 	m_rs232_status_output = 0;
 	m_rs232_data_output = 0;
 	// The monitor polls MC146818 register A through $D810/$D811 during boot
-	// and waits for UIP to clear.  Start from a valid divider/rate register
-	// instead of inheriting an erased NVRAM byte.
+	// and waits for UIP to clear.  Start from valid divider/rate registers
+	// instead of inheriting erased NVRAM bytes.  Do not prime status D here:
+	// an erased/invalid RTC is how the ROM reaches the full self-diagnostic.
 	m_rtc->write_direct(0x0a, 0x26);
 	m_rtc->write_direct(0x0b, 0x02);
-	m_rtc->read_direct(0x0d);
 	update_irq_line();
 	m_rtc_square_wave_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
 }
@@ -369,8 +390,8 @@ INPUT_CHANGED_MEMBER(herojr_state::sleep_norm_changed)
 
 INPUT_CHANGED_MEMBER(herojr_state::reset_changed)
 {
-	if (!oldval && newval)
-		pulse_reset_line();
+	if (oldval != newval)
+		set_reset_line(newval != 0);
 }
 
 void herojr_state::mem_map(address_map &map)
@@ -450,7 +471,7 @@ u8 herojr_state::rtc_r(offs_t offset)
 		if (address == 0x0a)
 			return data & 0x7f;
 		if (address == 0x0d && data == 0xff)
-			return 0x80;
+			return 0x00;
 		return data;
 	}
 
@@ -519,6 +540,9 @@ bool herojr_state::is_keypad_bridge_press(u8 data)
 
 bool herojr_state::is_keypad_bridge_release(u8 data)
 {
+	if (data == 0xff)
+		return true;
+
 	int low_count = 0;
 	for (int bit = 0; bit < 8; bit++)
 	{
@@ -653,17 +677,27 @@ TIMER_CALLBACK_MEMBER(herojr_state::rtc_square_wave_tick)
 
 u8 herojr_state::u215_speech_data_r()
 {
+	if (!BIT(m_u215_control_a, 2))
+		return m_u215_ddr_a;
+
+	if (!machine().side_effects_disabled())
+	{
+		m_speech_request_flag = 0;
+		m_speech_request_flag_output = 0;
+	}
 	return m_speech_data;
 }
 
 u8 herojr_state::u215_speech_power_r()
 {
-	return (m_u215_port_b & 0xaf) | (m_adc_output_state ? 0x10 : 0x00) | (m_sleep_norm->read() ? 0x40 : 0x00);
+	const u8 speech_busy = m_speech_request ? 0x00 : 0x01;
+	return (m_u215_port_b & 0xae) | speech_busy | (m_adc_output_state ? 0x10 : 0x00) | (m_sleep_norm->read() ? 0x40 : 0x00);
 }
 
 u8 herojr_state::u215_speech_control_r()
 {
-	return (m_u215_control_a & 0x3f) | (m_speech_request ? 0x80 : 0x00);
+	const u8 visible_request = (m_speech_request_flag && BIT(m_u215_control_a, 0)) ? 0x80 : 0x00;
+	return (m_u215_control_a & 0x3f) | visible_request;
 }
 
 u8 herojr_state::u215_sonar_echo_r()
@@ -673,6 +707,12 @@ u8 herojr_state::u215_sonar_echo_r()
 
 void herojr_state::u215_speech_data_w(u8 data)
 {
+	if (!BIT(m_u215_control_a, 2))
+	{
+		m_u215_ddr_a = data;
+		return;
+	}
+
 	m_port_outputs[0] = data;
 	set_speech_data(data);
 }
@@ -694,7 +734,9 @@ void herojr_state::u215_speech_power_w(u8 data)
 	{
 		m_votrax->reset();
 		m_speech_request = 1;
+		m_speech_request_flag = 0;
 		m_speech_ready = 1;
+		m_speech_request_flag_output = 0;
 	}
 }
 
@@ -703,10 +745,19 @@ void herojr_state::u215_speech_control_w(u8 data)
 	m_port_outputs[2] = data;
 	m_u215_control_a = data & 0x3f;
 	const u8 previous_strobe = m_speech_strobe_state;
-	m_speech_strobe_state = BIT(data, 3) ? 1 : 0;
+	const u8 requested_strobe = BIT(data, 3) ? 1 : 0;
+	m_speech_strobe_state = requested_strobe;
 	m_speech_strobe = m_speech_strobe_state;
-	if (!previous_strobe && m_speech_strobe_state)
+	if (!requested_strobe)
+	{
+		m_speech_strobe_clear_timer->adjust(attotime::never);
+		return;
+	}
+	if (!previous_strobe)
+	{
 		latch_speech_phoneme();
+		m_speech_strobe_clear_timer->adjust(attotime::from_usec(100));
+	}
 }
 
 void herojr_state::u215_sonar_echo_w(u8 data)
@@ -742,8 +793,39 @@ void herojr_state::rs232_w(offs_t offset, u8 data)
 
 void herojr_state::speech_request_w(int state)
 {
+	const u8 previous_request = m_speech_request;
 	m_speech_request = state ? 1 : 0;
 	m_speech_ready = m_speech_request;
+	if (!previous_request && m_speech_request)
+	{
+		m_speech_request_flag = 1;
+		m_speech_request_flag_output = m_speech_request_flag;
+	}
+	if (!m_speech_request)
+		m_speech_request_fallback_timer->adjust(attotime::from_msec(500));
+	else
+		m_speech_request_fallback_timer->adjust(attotime::never);
+}
+
+TIMER_CALLBACK_MEMBER(herojr_state::speech_strobe_clear)
+{
+	m_speech_strobe_state = 0;
+	m_speech_strobe = 0;
+}
+
+TIMER_CALLBACK_MEMBER(herojr_state::speech_request_fallback)
+{
+	// SC-01 phoneme durations are finite.  Save-state/reset edges can leave the
+	// generic Votrax device without a later AR callback; keep the ROM-visible
+	// request line from remaining busy forever in that impossible hardware state.
+	if (!m_speech_request)
+	{
+		m_votrax->reset();
+		m_speech_request = 1;
+		m_speech_request_flag = 0;
+		m_speech_ready = 1;
+		m_speech_request_flag_output = m_speech_request_flag;
+	}
 }
 
 void herojr_state::acia_irq_w(int state)
@@ -766,6 +848,7 @@ void herojr_state::latch_speech_phoneme()
 
 	m_votrax->inflection_w((m_speech_data >> 6) & 0x03);
 	m_votrax->write(m_speech_data & 0x3f);
+	m_speech_request_fallback_timer->adjust(attotime::from_msec(500));
 }
 
 u8 herojr_state::selected_adc_sample() const

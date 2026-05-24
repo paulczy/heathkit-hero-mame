@@ -382,6 +382,8 @@ local supported_commands = {
   "press_key",
   "release_key",
   "set_sleep_norm",
+  "save_state",
+  "load_state",
   "warm_start",
   "reset_machine"
 }
@@ -838,6 +840,14 @@ local function read_u8(addr)
   return program_space():read_u8(addr & 0xffff)
 end
 
+local function herojr_d842_snapshot(port_prefix, speech_prefix)
+  local output = manager.machine.output
+  local control = output:get_indexed_value(port_prefix, 2) or 0
+  local request = output:get_value("herojr_speech_request_flag") or 0
+  local visible_request = request ~= 0 and (control & 0x01) ~= 0
+  return (control & 0x3f) | (visible_request and 0x80 or 0)
+end
+
 local function reset_vector()
   return ((read_u8(0xfffe) << 8) | read_u8(0xffff)) & 0xffff
 end
@@ -951,7 +961,7 @@ local function get_io_state()
   local herojr_d822 = prefix == "herojr" and read_u8(0xd822) or 0
   local herojr_d823 = prefix == "herojr" and read_u8(0xd823) or 0
   local herojr_d841 = prefix == "herojr" and read_u8(0xd841) or 0
-  local herojr_d842 = prefix == "herojr" and read_u8(0xd842) or 0
+  local herojr_d842 = prefix == "herojr" and herojr_d842_snapshot(port_prefix, speech_prefix) or 0
   local herojr_d843 = prefix == "herojr" and read_u8(0xd843) or 0
   local herojr_motion_detector = output_value(prefix .. "_motion_detector")
   local herojr_wheel_feedback = output_value(prefix .. "_wheel_feedback")
@@ -1004,7 +1014,7 @@ local function get_io_state()
         sonarDistanceInches = sensor_state.sonarDistanceInches,
         lightLevel = sensor_state.lightLevel,
         soundLevel = sensor_state.soundLevel,
-        motionDetected = sensor_state.motionDetected
+        motionDetected = prefix == "herojr" and herojr_motion_detector ~= 0 or sensor_state.motionDetected
       },
       speech = {
         phoneme = output_value(speech_prefix .. "phoneme"),
@@ -1426,11 +1436,38 @@ local function set_sleep_norm(params)
   return { sleepNorm = norm and 1 or 0 }
 end
 
+local function state_file_name(params, command)
+  local file = params and params.file
+  if type(file) ~= "string" or file == "" then
+    error(command .. " requires non-empty file")
+  end
+
+  return file
+end
+
+local function save_state(params)
+  local file = state_file_name(params, "save_state")
+  manager.machine:save(file)
+  emu.unpause()
+  cpu_debug():go()
+  return { file = file }
+end
+
+local function load_state(params)
+  local file = state_file_name(params, "load_state")
+  manager.machine:load(file)
+  emu.unpause()
+  cpu_debug():go()
+  return { file = file }
+end
+
 local function seed_herojr_warm_rtc_context()
   -- The v1.6 reset path reads MC146818 register $0E after confirming register
   -- $0D bit 7.  A fresh emulator has this retained CMOS byte clear, which
   -- makes the ROM take the first-time diagnostic path.  A physical warm start
   -- reaches reset from retained sleep state, so preserve that context here.
+  write_u8(0xd810, 0x0d)
+  read_u8(0xd811)
   write_u8(0xd810, 0x0e)
   write_u8(0xd811, 0xff)
 end
@@ -1450,6 +1487,7 @@ end
 
 local function reset_machine(params)
   local preserve_herojr_keys = system_name() == "herojr" and params and params.preserveKeys == true
+  local preserve_warm_context = not params or params.preserveWarmContext ~= false
   clear_temp_step_breakpoints()
   if not preserve_herojr_keys then
     keypad_state = {}
@@ -1468,10 +1506,15 @@ local function reset_machine(params)
     end
   end
   if system_name() == "herojr" then
+    sensor_state.motionDetected = false
+    if preserve_warm_context then
+      seed_herojr_warm_rtc_context()
+    end
     set_herojr_reset_field(false)
     if not set_herojr_reset_field(true) then
       error("reset_machine requires HERO Jr RESET input")
     end
+    write_u8(herojr_sensor_base + 0x03, 0)
     pending_herojr_reset_release_frames = 2
     if preserve_herojr_keys then
       write_u8(0xd820, herojr_keypad_byte())
@@ -1546,6 +1589,8 @@ local handlers = {
   press_key = press_key,
   release_key = release_key,
   set_sleep_norm = set_sleep_norm,
+  save_state = save_state,
+  load_state = load_state,
   warm_start = warm_start,
   reset_machine = reset_machine
 }

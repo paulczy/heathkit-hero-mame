@@ -289,6 +289,7 @@ void votrax_sc01_device::device_reset()
 
 	m_phone = 0x3f;
 	m_inflection = 0;
+	m_timer->adjust(attotime::never);
 	m_ar_state = ASSERT_LINE;
 	m_ar_cb(m_ar_state);
 
