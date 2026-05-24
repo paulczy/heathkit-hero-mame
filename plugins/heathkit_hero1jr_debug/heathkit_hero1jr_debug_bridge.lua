@@ -97,10 +97,26 @@ if not socket_ok then
   socket = make_emu_file_socket_module()
 end
 
+local function parse_trace_categories(value)
+  local categories = {}
+  local raw = tostring(value or ""):lower()
+  if raw == "1" or raw == "true" or raw == "all" then
+    categories["all"] = true
+    return categories
+  end
+
+  for category in raw:gmatch("[^,%s]+") do
+    categories[category] = true
+  end
+
+  return categories
+end
+
 local host = os.getenv("HEATHKIT_HERO_BRIDGE_HOST") or "127.0.0.1"
 local port = tonumber(os.getenv("HEATHKIT_HERO_BRIDGE_PORT") or "6808")
 local autostart_monitor = os.getenv("HEATHKIT_HERO_BRIDGE_AUTOSTART_MONITOR") == "1"
-local bridge_trace = os.getenv("HEATHKIT_HERO_BRIDGE_TRACE") == "1"
+local bridge_trace_categories = parse_trace_categories(os.getenv("HEATHKIT_HERO_BRIDGE_TRACE"))
+local session_id = os.getenv("HEATHKIT_HERO_SESSION_ID") or ""
 local herojr_initial_sleep = os.getenv("HEATHKIT_HEROJR_INITIAL_SLEEP") == "1"
 local autostart_monitor_pending = autostart_monitor
 local herojr_initial_sleep_pending = herojr_initial_sleep
@@ -142,9 +158,26 @@ local sensor_state = {
 }
 local keypad_state = {}
 local keypad_columns = { 0x3f, 0x3f, 0x3f }
-local function trace(message)
-  if bridge_trace then
-    emu.print_info("heathkit_hero1jr_debug: trace: " .. message)
+local function log_prefix()
+  if session_id ~= "" then
+    return "heathkit_hero1jr_debug[" .. session_id .. "]"
+  end
+
+  return "heathkit_hero1jr_debug"
+end
+
+local function trace_enabled(category)
+  return bridge_trace_categories["all"] or bridge_trace_categories[category]
+end
+
+local function trace(category, message)
+  if message == nil then
+    message = category
+    category = "rpc"
+  end
+
+  if trace_enabled(category) then
+    emu.print_info(log_prefix() .. ": trace:" .. category .. ": " .. message)
   end
 end
 
@@ -1447,7 +1480,12 @@ end
 
 local function save_state(params)
   local file = state_file_name(params, "save_state")
-  manager.machine:save(file)
+  trace("state", "save_state requesting file=" .. file .. " pc=" .. trace_address(get_register("pc")))
+  local ok, result = pcall(function() return manager.machine:save(file) end)
+  trace("state", "save_state machine:save ok=" .. tostring(ok) .. " result=" .. tostring(result))
+  if not ok then
+    error(result)
+  end
   emu.unpause()
   cpu_debug():go()
   return { file = file }
@@ -1455,7 +1493,12 @@ end
 
 local function load_state(params)
   local file = state_file_name(params, "load_state")
-  manager.machine:load(file)
+  trace("state", "load_state requesting file=" .. file .. " pc=" .. trace_address(get_register("pc")))
+  local ok, result = pcall(function() return manager.machine:load(file) end)
+  trace("state", "load_state machine:load ok=" .. tostring(ok) .. " result=" .. tostring(result))
+  if not ok then
+    error(result)
+  end
   emu.unpause()
   cpu_debug():go()
   return { file = file }
@@ -1609,7 +1652,7 @@ local function handle_request(client, line)
   end
 
   trace("request #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " pc=" .. trace_address(get_register("pc")))
-  local success, result = pcall(handler, request.params or {})
+  local success, result = xpcall(function() return handler(request.params or {}) end, debug.traceback)
   if success then
     trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " ok")
     send_line(client, { id = request.id, ok = true, result = result or {} })
@@ -1640,7 +1683,7 @@ end
 local function poll()
   if herojr_initial_sleep_pending and set_herojr_sleep_norm_field(false) then
     herojr_initial_sleep_pending = false
-    emu.print_info("heathkit_hero1jr_debug: initialized HERO Jr Sleep/Norm switch to Sleep")
+    emu.print_info(log_prefix() .. ": initialized HERO Jr Sleep/Norm switch to Sleep")
   end
 
   if pending_herojr_reset_release_frames > 0 then
@@ -1668,7 +1711,7 @@ local function poll()
     manager.machine:soft_reset()
     emu.unpause()
     cpu_debug():go()
-    emu.print_info("heathkit_hero1jr_debug: autostarted HERO ROM monitor at reset vector $" .. string.format("%04X", vector))
+    emu.print_info(log_prefix() .. ": autostarted HERO ROM monitor at reset vector $" .. string.format("%04X", vector))
   end
 
   if server then
@@ -1783,7 +1826,7 @@ function bridge.start()
     end
   end)
   local transport = socket_ok and "LuaSocket" or "emu.file"
-  emu.print_info("heathkit_hero1jr_debug: bridge listening on " .. host .. ":" .. tostring(port) .. " via " .. transport)
+  emu.print_info(log_prefix() .. ": bridge listening on " .. host .. ":" .. tostring(port) .. " via " .. transport)
 end
 
 return bridge
