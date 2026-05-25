@@ -286,7 +286,7 @@ local function herojr_keypad_byte()
     if is_pressed then
       local nibble = tonumber(key, 16)
       if nibble then
-        local column_mask = 1 << (nibble & 0x03)
+        local column_mask = 1 << (3 - (nibble & 0x03))
         local row_mask = 0x10 << ((nibble >> 2) & 0x03)
         value = value & (~(column_mask | row_mask) & 0xff)
       end
@@ -327,7 +327,7 @@ local function set_herojr_keypad_field(key, pressed)
   end
 
   local row = (nibble >> 2) & 0x03
-  local column = nibble & 0x03
+  local column = 3 - (nibble & 0x03)
   local port = manager.machine.ioport.ports[":KEY" .. tostring(row)] or manager.machine.ioport.ports["KEY" .. tostring(row)]
   if not port then
     return

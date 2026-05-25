@@ -97,6 +97,7 @@ protected:
 
 private:
 	static constexpr u16 HEROJR_SENSOR_BASE = 0xd860; // bridge injection aperture, not original hardware
+	static constexpr s16 HEROJR_STEERING_LIMIT_STEPS = 32;
 
 	DECLARE_DEVICE_IMAGE_LOAD_MEMBER(cart_load);
 	void mem_map(address_map &map) ATTR_COLD;
@@ -130,6 +131,8 @@ private:
 	void set_speech_data(u8 data);
 	void latch_speech_phoneme();
 	bool drive_feedback_active() const;
+	u8 steering_limit_mask() const;
+	void update_steering_position(u8 data);
 	void advance_wheel_feedback_sample();
 	void update_drive_sonar_motion();
 	u8 selected_adc_sample() const;
@@ -224,6 +227,8 @@ private:
 	u8 m_rs232_status = 0;
 	u8 m_rs232_data = 0;
 	u32 m_drive_activity_count = 0;
+	s16 m_steering_position = 0;
+	u8 m_steering_phase = 0;
 	bool m_driver_trace = false;
 	emu_timer *m_speech_strobe_clear_timer = nullptr;
 	emu_timer *m_speech_request_fallback_timer = nullptr;
@@ -292,6 +297,8 @@ void herojr_state::machine_start()
 	save_item(NAME(m_rs232_status));
 	save_item(NAME(m_rs232_data));
 	save_item(NAME(m_drive_activity_count));
+	save_item(NAME(m_steering_position));
+	save_item(NAME(m_steering_phase));
 
 	m_speech_strobe_clear_timer = timer_alloc(FUNC(herojr_state::speech_strobe_clear), this);
 	m_speech_request_fallback_timer = timer_alloc(FUNC(herojr_state::speech_request_fallback), this);
@@ -352,6 +359,8 @@ void herojr_state::reset_interface_state()
 	m_speech_strobe_clear_timer->adjust(attotime::never);
 	m_speech_request_fallback_timer->adjust(attotime::never);
 	m_drive_activity_count = 0;
+	m_steering_position = 0;
+	m_steering_phase = 0;
 	m_speech_phoneme = 0;
 	m_speech_inflection = 0;
 	m_speech_strobe = 0;
@@ -543,14 +552,7 @@ u8 herojr_state::keypad_matrix_r()
 		}
 	}
 
-	if (drive_feedback_active() || m_wheel_feedback_port_a_count != 0)
-	{
-		advance_wheel_feedback_sample();
-		data = (data & ~0xc0) | ((m_wheel_feedback_sample & 0x03) << 6);
-		if (!drive_feedback_active() && m_u214_port_a == 0xff)
-			m_wheel_feedback_port_a_count--;
-	}
-
+	data &= ~steering_limit_mask();
 	return data;
 }
 
@@ -571,9 +573,6 @@ bool herojr_state::is_keypad_bridge_press(u8 data)
 
 bool herojr_state::is_keypad_bridge_release(u8 data)
 {
-	if (data == 0xff)
-		return true;
-
 	int low_count = 0;
 	for (int bit = 0; bit < 8; bit++)
 	{
@@ -591,7 +590,54 @@ u8 herojr_state::u214_port_b_r()
 
 bool herojr_state::drive_feedback_active() const
 {
-	return (m_u214_port_b & 0x3e) != 0;
+	return BIT(m_u214_port_b, 1);
+}
+
+u8 herojr_state::steering_limit_mask() const
+{
+	if (m_steering_phase == 0)
+		return 0x00;
+	if (m_steering_position >= HEROJR_STEERING_LIMIT_STEPS)
+		return 0x80;
+	if (m_steering_position <= -HEROJR_STEERING_LIMIT_STEPS)
+		return 0x40;
+	return 0x00;
+}
+
+void herojr_state::update_steering_position(u8 data)
+{
+	const u8 phase = data & 0x3c;
+	const auto phase_index = [](u8 value) -> int
+	{
+		switch (value)
+		{
+		case 0x0c: return 0;
+		case 0x18: return 1;
+		case 0x30: return 2;
+		case 0x24: return 3;
+		default: return -1;
+		}
+	};
+
+	const int previous_index = phase_index(m_steering_phase);
+	const int current_index = phase_index(phase);
+	if (current_index < 0)
+	{
+		if (phase == 0)
+			m_steering_phase = 0;
+		return;
+	}
+
+	if (previous_index >= 0 && previous_index != current_index)
+	{
+		const int delta = (current_index - previous_index + 4) & 0x03;
+		if (delta == 1)
+			m_steering_position = std::min<s16>(HEROJR_STEERING_LIMIT_STEPS, m_steering_position + 1);
+		else if (delta == 3)
+			m_steering_position = std::max<s16>(-HEROJR_STEERING_LIMIT_STEPS, m_steering_position - 1);
+	}
+
+	m_steering_phase = phase;
 }
 
 void herojr_state::advance_wheel_feedback_sample()
@@ -631,12 +677,22 @@ void herojr_state::u214_port_a_w(u8 data)
 void herojr_state::u214_port_b_w(u8 data)
 {
 	m_u214_port_b = data & 0x7f;
+	update_steering_position(data);
 	if ((m_u214_port_b & 0x3e) != 0)
 	{
 		m_drive_activity_count++;
 		m_drive_activity = m_drive_activity_count;
+	}
+	if (drive_feedback_active())
+	{
 		m_wheel_feedback_port_a_count = 2048;
 		advance_wheel_feedback_sample();
+	}
+	else
+	{
+		m_wheel_feedback_port_a_count = 0;
+		m_wheel_feedback_sample = 0;
+		m_wheel_feedback = 0;
 	}
 	// HERO Jr Technical Manual: $D821 D1 controls main drive motor A2,
 	// D0 controls relay RY301 for direction, and D2-D5 drive steering phases.
@@ -644,7 +700,7 @@ void herojr_state::u214_port_b_w(u8 data)
 	m_motor_right = BIT(data, 0) ? 1 : 0;
 	m_port_outputs[3] = (data & 0x3c) << 2;
 	m_port_outputs[5] = (BIT(data, 1) ? 0x40 : 0x00) | (BIT(data, 0) ? 0x80 : 0x00);
-	driver_tracef("u214_port_b_w data=$%02X latched=$%02X drive_activity=%u wheel_feedback=%u feedback_count=%u", data, m_u214_port_b, m_drive_activity_count, m_wheel_feedback_sample, m_wheel_feedback_port_a_count);
+	driver_tracef("u214_port_b_w data=$%02X latched=$%02X drive_activity=%u wheel_feedback=%u feedback_count=%u steering_position=%d steering_limit=$%02X", data, m_u214_port_b, m_drive_activity_count, m_wheel_feedback_sample, m_wheel_feedback_port_a_count, m_steering_position, steering_limit_mask());
 	update_u214_input_outputs();
 }
 
@@ -955,28 +1011,28 @@ DEVICE_IMAGE_LOAD_MEMBER(herojr_state::cart_load)
 
 static INPUT_PORTS_START(herojr)
 	PORT_START("KEY0")
-	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("RT-1") PORT_CODE(KEYCODE_0_PAD)
-	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("1") PORT_CODE(KEYCODE_1)
-	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("2") PORT_CODE(KEYCODE_2)
-	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("3") PORT_CODE(KEYCODE_3)
+	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("RT-1") PORT_CODE(KEYCODE_0_PAD)
+	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("1") PORT_CODE(KEYCODE_1)
+	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("2") PORT_CODE(KEYCODE_2)
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("3") PORT_CODE(KEYCODE_3)
 
 	PORT_START("KEY1")
-	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("SING / 4") PORT_CODE(KEYCODE_4)
-	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("PLAY / 5") PORT_CODE(KEYCODE_5)
-	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("HELP / 6") PORT_CODE(KEYCODE_6)
-	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("SPEAK / 7") PORT_CODE(KEYCODE_7)
+	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("SING / 4") PORT_CODE(KEYCODE_4)
+	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("PLAY / 5") PORT_CODE(KEYCODE_5)
+	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("HELP / 6") PORT_CODE(KEYCODE_6)
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("SPEAK / 7") PORT_CODE(KEYCODE_7)
 
 	PORT_START("KEY2")
-	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("GAB / 8") PORT_CODE(KEYCODE_8)
-	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("POET / 9") PORT_CODE(KEYCODE_9)
-	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("DEMO / A") PORT_CODE(KEYCODE_A)
-	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("GUARD / B") PORT_CODE(KEYCODE_B)
+	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("GAB / 8") PORT_CODE(KEYCODE_8)
+	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("POET / 9") PORT_CODE(KEYCODE_9)
+	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("DEMO / A") PORT_CODE(KEYCODE_A)
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("GUARD / B") PORT_CODE(KEYCODE_B)
 
 	PORT_START("KEY3")
-	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("ALARM / C") PORT_CODE(KEYCODE_C)
-	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("PLAN / D") PORT_CODE(KEYCODE_D)
-	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("SET UP / E") PORT_CODE(KEYCODE_E)
-	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("ENTER / F") PORT_CODE(KEYCODE_F)
+	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("ALARM / C") PORT_CODE(KEYCODE_C)
+	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("PLAN / D") PORT_CODE(KEYCODE_D)
+	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("SET UP / E") PORT_CODE(KEYCODE_E)
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("ENTER / F") PORT_CODE(KEYCODE_F)
 
 	PORT_START("LIGHT")
 	PORT_ADJUSTER(50, "Light level")
