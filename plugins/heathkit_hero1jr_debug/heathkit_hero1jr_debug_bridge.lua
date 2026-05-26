@@ -393,7 +393,6 @@ local pending_step_reason = nil
 local pending_step_start_pc = nil
 local pending_step_seen_run = false
 local pending_herojr_reset_release_frames = 0
-local pending_herojr_warm_reset_frames = 0
 local supported_commands = {
   "get_capabilities",
   "get_registers",
@@ -417,7 +416,7 @@ local supported_commands = {
   "set_sleep_norm",
   "save_state",
   "load_state",
-  "warm_start",
+  "initialize_herojr_warm_context",
   "reset_machine"
 }
 
@@ -1563,33 +1562,89 @@ local function load_state(params)
   return { file = file }
 end
 
-local function seed_herojr_warm_rtc_context()
-  -- The v1.6 reset path reads MC146818 register $0E after confirming register
-  -- $0D bit 7.  A fresh emulator has this retained CMOS byte clear, which
-  -- makes the ROM take the first-time diagnostic path.  A physical warm start
-  -- reaches reset from retained sleep state, so preserve that context here.
-  write_u8(0xd810, 0x0d)
-  read_u8(0xd811)
-  write_u8(0xd810, 0x0e)
-  write_u8(0xd811, 0xff)
+local function bcd(value)
+  return ((math.floor(value / 10) << 4) | (value % 10)) & 0xff
 end
 
-local function warm_start()
-  if not set_herojr_sleep_norm_field(true) then
-    error("warm_start requires HERO Jr SLEEP_NORM input")
+local function write_rtc_register(register, value)
+  write_u8(0xd810, register & 0xff)
+  write_u8(0xd811, value & 0xff)
+end
+
+local function read_rtc_register(register)
+  write_u8(0xd810, register & 0xff)
+  return read_u8(0xd811)
+end
+
+local function parse_warm_context_time(params)
+  if params and params.timestamp then
+    local y, mo, d, h, mi, s = string.match(
+      params.timestamp,
+      "^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):(%d%d)"
+    )
+    if not y then
+      error("initialize_herojr_warm_context timestamp must be YYYY-MM-DDTHH:MM:SS")
+    end
+    return {
+      year = tonumber(y),
+      month = tonumber(mo),
+      day = tonumber(d),
+      hour = tonumber(h),
+      minute = tonumber(mi),
+      second = tonumber(s)
+    }
   end
 
-  seed_herojr_warm_rtc_context()
-  pending_herojr_warm_reset_frames = 2
-  emu.unpause()
-  cpu_debug():go()
-  broadcast_io_changed(true)
-  return { sleepNorm = 1, rtcWarmFlag = 0xff, sequence = "sleep-norm-reset-key" }
+  return os.date("*t")
+end
+
+local function initialize_herojr_warm_context(params)
+  if system_name() ~= "herojr" then
+    error("initialize_herojr_warm_context is HERO Jr only")
+  end
+
+  local t = parse_warm_context_time(params or {})
+  local dst = params and params.dst
+  if dst == nil then
+    dst = t.isdst == true
+  end
+
+  -- ROM $EE07 commits seconds, minutes, hours, day-of-week, day-of-month,
+  -- month, and year into RTC registers $00-$06.
+  write_rtc_register(0x00, bcd(t.second or 0))
+  write_rtc_register(0x01, bcd(t.minute or 0))
+  write_rtc_register(0x02, bcd(t.hour or 0))
+  write_rtc_register(0x03, bcd(t.wday or 1))
+  write_rtc_register(0x04, bcd(t.day or 1))
+  write_rtc_register(0x05, bcd(t.month or 1))
+  write_rtc_register(0x06, bcd((t.year or 1984) % 100))
+
+  local reg_b = read_rtc_register(0x0b)
+  if dst then
+    reg_b = reg_b | 0x01
+  else
+    reg_b = reg_b & 0xfe
+  end
+  write_rtc_register(0x0b, reg_b)
+
+  local reg_c = read_rtc_register(0x0c) & 0xdf
+  write_rtc_register(0x0c, reg_c)
+  write_rtc_register(0x0d, read_rtc_register(0x0d) | 0x80)
+  write_rtc_register(0x0e, 0xff)
+
+  return {
+    rtcWarmFlag = 0xff,
+    registers = {
+      ["0x0bBit0"] = dst and 1 or 0,
+      ["0x0cAf"] = 0,
+      ["0x0dVrt"] = 1,
+      ["0x0eCookie"] = 0xff
+    }
+  }
 end
 
 local function reset_machine(params)
   local preserve_herojr_keys = system_name() == "herojr" and params and params.preserveKeys == true
-  local preserve_warm_context = not params or params.preserveWarmContext ~= false
   clear_temp_step_breakpoints()
   if not preserve_herojr_keys then
     keypad_state = {}
@@ -1609,9 +1664,6 @@ local function reset_machine(params)
   end
   if system_name() == "herojr" then
     sensor_state.motionDetected = false
-    if preserve_warm_context then
-      seed_herojr_warm_rtc_context()
-    end
     set_herojr_reset_field(false)
     if not set_herojr_reset_field(true) then
       error("reset_machine requires HERO Jr RESET input")
@@ -1693,7 +1745,7 @@ local handlers = {
   set_sleep_norm = set_sleep_norm,
   save_state = save_state,
   load_state = load_state,
-  warm_start = warm_start,
+  initialize_herojr_warm_context = initialize_herojr_warm_context,
   reset_machine = reset_machine
 }
 
@@ -1755,15 +1807,6 @@ local function poll()
     pending_herojr_reset_release_frames = pending_herojr_reset_release_frames - 1
     if pending_herojr_reset_release_frames == 0 then
       set_herojr_reset_field(false)
-    end
-  end
-
-  if pending_herojr_warm_reset_frames > 0 then
-    pending_herojr_warm_reset_frames = pending_herojr_warm_reset_frames - 1
-    if pending_herojr_warm_reset_frames == 0 then
-      set_herojr_reset_field(false)
-      set_herojr_reset_field(true)
-      pending_herojr_reset_release_frames = 2
     end
   end
 
