@@ -1598,6 +1598,65 @@ local function parse_warm_context_time(params)
   return os.date("*t")
 end
 
+local function initialize_herojr_retained_ram_context(t)
+  -- ROM $800F initializes the personality/scheduler workspace on the cold
+  -- path. A real Sleep/Norm warm start preserves this RAM while taking $A070.
+  local retained_defaults = {
+    { 0x02fa, 0x02 },
+    { 0x02fb, 0x04 },
+    { 0x02fc, 0x02 },
+    { 0x02fd, 0x02 },
+    { 0x02fe, 0x02 },
+    { 0x02ff, 0x00 },
+    { 0x0300, 0x08 },
+    { 0x0301, 0x06 },
+    { 0x0302, 0x01 }
+  }
+  for _, entry in ipairs(retained_defaults) do
+    write_u8(entry[1], entry[2])
+  end
+
+  write_u8(0x02f4, 0x00)
+  write_u8(0x02f5, 0x00)
+  for i = 0, 15 do
+    write_u8(0x00c4 + (i * 5), 0x00)
+  end
+
+  local rtc_snapshot = {
+    bcd(t.second or 0),
+    bcd(t.minute or 0),
+    bcd(t.hour or 0),
+    bcd(t.wday or 1),
+    bcd(t.day or 1),
+    bcd(t.month or 1),
+    bcd((t.year or 1984) % 100)
+  }
+
+  for i, value in ipairs(rtc_snapshot) do
+    write_u8(0x067f + ((i - 1) * 2), value)
+    write_u8(0x0092 + i, value)
+  end
+
+  write_u8(0x009b, rtc_snapshot[3])
+  write_u8(0x009c, rtc_snapshot[2])
+  write_u8(0x009d, rtc_snapshot[5])
+  write_u8(0x009e, rtc_snapshot[6])
+  write_u8(0x009f, rtc_snapshot[7])
+
+  write_u8(0x03be, 0xa7)
+  write_u8(0x03bf, 0x1c)
+  write_u8(0x03c0, 0xa7)
+  write_u8(0x03c1, 0x2b)
+  write_u8(0x0080, 0x39)
+
+  -- ROM $A05F-$A06D clears startup flags and seeds the retained plan root.
+  write_u8(0x0085, 0x00)
+  write_u8(0x0086, 0x00)
+  write_u8(0x0088, 0x00)
+  write_u8(0x0677, 0x00)
+  write_u8(0x0678, 0x01)
+end
+
 local function initialize_herojr_warm_context(params)
   if system_name() ~= "herojr" then
     error("initialize_herojr_warm_context is HERO Jr only")
@@ -1631,9 +1690,18 @@ local function initialize_herojr_warm_context(params)
   write_rtc_register(0x0c, reg_c)
   write_rtc_register(0x0d, read_rtc_register(0x0d) | 0x80)
   write_rtc_register(0x0e, 0xff)
+  initialize_herojr_retained_ram_context(t)
 
   return {
     rtcWarmFlag = 0xff,
+    retainedRam = {
+      defaultStateInitializer = "0x800F",
+      startupFlagInitializer = "0xA05F-0xA06D",
+      functionReturnStub = 0x39,
+      robotNamePointer = 0xa71c,
+      masterNamePointer = 0xa72b,
+      planRoot = 0x0001
+    },
     registers = {
       ["0x0bBit0"] = dst and 1 or 0,
       ["0x0cAf"] = 0,

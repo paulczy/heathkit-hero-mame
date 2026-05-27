@@ -533,6 +533,9 @@ u8 herojr_state::u214_port_a_r()
 
 u8 herojr_state::keypad_matrix_r()
 {
+	if (is_keypad_bridge_press(m_keypad_bridge_byte) && m_u214_port_a == 0xff)
+		return m_keypad_bridge_byte;
+
 	u8 data = m_u214_port_a;
 	for (int row = 0; row < 4; row++)
 	{
