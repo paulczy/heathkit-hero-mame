@@ -231,7 +231,7 @@ void sunplus_gcm394_base_device::chipselect_csx_memory_device_control_w(offs_t o
 	m_782x[offset] = data;
 
 
-	static const char* const md[] =
+	static char const *const md[] =
 	{
 		"(00) ROM / SRAM",
 		"(01) ROM / SRAM",
@@ -561,7 +561,7 @@ void sunplus_gcm394_base_device::int_status1_w(u16 data)
 // 10  TMBCIF
 //  9  TMBBIF
 //  8  TMBAIF
-// 
+//
 //  7  SDC2
 //  6  SDC1
 //  5
@@ -577,15 +577,15 @@ u16 sunplus_gcm394_base_device::int_status2_r()
 	LOGMASKED(LOG_GCM394, "%s:sunplus_gcm394_base_device::int_status2_r\n", machine().describe_context());
 	u16 ret = 0;
 
-	if (m_gpl_timebase->timebasea_irq_flag())
+	if (m_gpl_timebase->timebase_irq_flag<0>())
 		ret |= 0x0100;
 
-	if (m_gpl_timebase->timebaseb_irq_flag())
+	if (m_gpl_timebase->timebase_irq_flag<1>())
 		ret |= 0x0200;
 
-	if (m_gpl_timebase->timebasec_irq_flag())
+	if (m_gpl_timebase->timebase_irq_flag<2>())
 		ret |= 0x0400;
-	
+
 	return ret;
 }
 
@@ -693,7 +693,7 @@ void sunplus_gcm394_base_device::mint_ctrl_w(u16 data)
 
 void sunplus_gcm394_base_device::update_interrupts(int state)
 {
-	if ((m_gpl_timebase->timebasea_irq_flag() && !m_disable_timebase_interrupts) || (m_gpl_timebase->timebaseb_irq_flag() && !m_disable_timebase_interrupts))
+	if ((m_gpl_timebase->timebase_irq_flag<0>() && !m_disable_timebase_interrupts) || (m_gpl_timebase->timebase_irq_flag<1>() && !m_disable_timebase_interrupts))
 	{
 		set_state_unsynced(UNSP_IRQ7_LINE, ASSERT_LINE);
 	}
@@ -702,7 +702,7 @@ void sunplus_gcm394_base_device::update_interrupts(int state)
 		set_state_unsynced(UNSP_IRQ7_LINE, CLEAR_LINE);
 	}
 
-	if ((m_gpl_timebase->timebasec_irq_flag() && !m_disable_timebase_interrupts) || (m_rtc_int_status & 0x0100))
+	if ((m_gpl_timebase->timebase_irq_flag<2>() && !m_disable_timebase_interrupts) || (m_rtc_int_status & 0x0100))
 	{
 		set_state_unsynced(UNSP_IRQ6_LINE, ASSERT_LINE);
 	}
@@ -1578,7 +1578,7 @@ void sunplus_gcm394_base_device::base_internal_map(address_map &map)
 	map(0x007882, 0x007882).rw(FUNC(sunplus_gcm394_base_device::ioe_dir_r), FUNC(sunplus_gcm394_base_device::ioe_dir_w));
 	map(0x007883, 0x007883).rw(FUNC(sunplus_gcm394_base_device::ioe_attrib_r), FUNC(sunplus_gcm394_base_device::ioe_attrib_w));
 	// 7884 - P_IOE_Drv
-	
+
 	// 0x7888 - P_MEM_DRV
 	// 0x7889 - P_MEM_DLY0
 	// 0x788a - P_MEM_DLY1
@@ -1903,7 +1903,7 @@ IRQ_CALLBACK_MEMBER(sunplus_gcm394_base_device::irq_vector_cb)
 	//logerror("irq_vector_cb %d\n", irqline);
 
 	//if (irqline == UNSP_IRQ6_LINE)
-	//	set_state_unsynced(UNSP_IRQ6_LINE, CLEAR_LINE);
+	//  set_state_unsynced(UNSP_IRQ6_LINE, CLEAR_LINE);
 
 	if (irqline == UNSP_IRQ4_LINE)
 		set_state_unsynced(UNSP_IRQ4_LINE, CLEAR_LINE);
@@ -1996,21 +1996,21 @@ void sunplus_gcm394_base_device::device_add_mconfig(machine_config &config)
 	m_gpl_dma->dma_complete_callback().set(FUNC(sunplus_gcm394_base_device::dma_complete));
 
 	GPL_TIMEBASE(config, m_gpl_timebase, 0);
-	m_gpl_timebase->updateirqs_callback().set(FUNC(sunplus_gcm394_base_device::update_interrupts));	
+	m_gpl_timebase->updateirqs_callback().set(FUNC(sunplus_gcm394_base_device::update_interrupts));
 
 	GCM394_VIDEO(config, m_spg_video, DERIVED_CLOCK(1, 1), DEVICE_SELF, m_screen);
 	m_spg_video->write_video_irq_callback().set(FUNC(sunplus_gcm394_base_device::videoirq_w));
 	m_spg_video->space_read_callback().set(FUNC(sunplus_gcm394_base_device::read_space));
 	m_spg_video->set_video_space(DEVICE_SELF, AS_PROGRAM);
 
-	TIMER(config, "timer_a").configure_generic(FUNC(sunplus_gcm394_base_device::timer_a_cb));
-	TIMER(config, "timer_b").configure_generic(FUNC(sunplus_gcm394_base_device::timer_b_cb));
-	TIMER(config, "timer_c").configure_generic(FUNC(sunplus_gcm394_base_device::timer_c_cb));
-	TIMER(config, "timer_d").configure_generic(FUNC(sunplus_gcm394_base_device::timer_d_cb));
-	TIMER(config, "timer_e").configure_generic(FUNC(sunplus_gcm394_base_device::timer_e_cb));
-	TIMER(config, "timer_f").configure_generic(FUNC(sunplus_gcm394_base_device::timer_f_cb));
+	TIMER(config, m_timer_a).configure_generic(FUNC(sunplus_gcm394_base_device::timer_a_cb));
+	TIMER(config, m_timer_b).configure_generic(FUNC(sunplus_gcm394_base_device::timer_b_cb));
+	TIMER(config, m_timer_c).configure_generic(FUNC(sunplus_gcm394_base_device::timer_c_cb));
+	TIMER(config, m_timer_d).configure_generic(FUNC(sunplus_gcm394_base_device::timer_d_cb));
+	TIMER(config, m_timer_e).configure_generic(FUNC(sunplus_gcm394_base_device::timer_e_cb));
+	TIMER(config, m_timer_f).configure_generic(FUNC(sunplus_gcm394_base_device::timer_f_cb));
 
-	TIMER(config, "scheduler").configure_generic(FUNC(sunplus_gcm394_base_device::scheduler_cb));
+	TIMER(config, m_scheduler).configure_generic(FUNC(sunplus_gcm394_base_device::scheduler_cb));
 }
 
 

@@ -303,6 +303,8 @@ G)ame Connector, dual row 50 pins
 #include "screen.h"
 #include "tilemap.h"
 
+#include "endianness.h"
+
 
 #define LOG_TLCS_TO_PPC_COMMANDS (1U << 1)
 #define LOG_PPC_TO_TLCS_COMMANDS (1U << 2)
@@ -1064,7 +1066,7 @@ void taitopjc_state::taitopjc(machine_config &config)
 	// H 0x294 / 0x3f / 0x221 / 0x24c / 0x294
 	// TODO: gets a 56.17 Hz with this, may be off by 1 or 2, verify on PCB, fix display ranges
 	screen.set_raw(XTAL(16'537'000), 660, 0, 482, 446, 0, 384);
-//	screen.set_visarea(0, 479, 0, 383);
+//  screen.set_visarea(0, 479, 0, 383);
 	screen.set_screen_update(FUNC(taitopjc_state::screen_update));
 	screen.set_palette(m_palette);
 
