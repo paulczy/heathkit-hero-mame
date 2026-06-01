@@ -533,9 +533,9 @@ void vt36x_gtct885_state::gtct885_prot_w(u8 data)
 	// so 0x20, 0x10, and 0x08 are outputs
 	// some kind of serial device
 
-	m_protection->write_data((data & 0x20) ? true : false);
-	m_protection->write_enable((data & 0x10) ? true : false);
-	m_protection->write_clock((data & 0x08) ? true : false);
+	m_protection->write_data(BIT(data, 5));
+	m_protection->write_enable(BIT(data, 4));
+	m_protection->write_clock(BIT(data, 3));
 }
 
 u8 vt36x_gtct885_state::gtct885_prot_r()
@@ -548,9 +548,9 @@ u8 vt36x_gtct885_state::gtct885_prot_r()
 void vt4ffx_goretrop_state::goretrop_prot_w(u8 data)
 {
 	// direction is set to 0x0e before writing here
-	m_protection->write_data((data & 0x08) ? true : false);
-	m_protection->write_enable((data & 0x04) ? true : false);
-	m_protection->write_clock((data & 0x02) ? false : true);
+	m_protection->write_data(BIT(data, 3));
+	m_protection->write_enable(BIT(data, 2));
+	m_protection->write_clock(BIT(~data, 1));
 }
 
 u8 vt4ffx_goretrop_state::goretrop_prot_r()
@@ -576,8 +576,8 @@ void vt36x_tetrtin_state::lxcap_prot_w(u8 data)
 
 	*/
 
-	m_protection->write_data((data & 0x02) ? true : false);
-	m_protection->write_clock((data & 0x01) ? true : false);
+	m_protection->write_data(BIT(data, 1));
+	m_protection->write_clock(BIT(data, 0));
 }
 
 u8 vt36x_tetrtin_state::lxcap_prot_r()
@@ -590,8 +590,8 @@ u8 vt36x_tetrtin_state::lxcap_prot_r()
 
 void vt36x_tetrtin_state::pixel_prot_w(u8 data)
 {
-	m_protection->write_data((data & 0x10) ? true : false);
-	m_protection->write_clock((data & 0x20) ? true : false);
+	m_protection->write_data(BIT(data, 4));
+	m_protection->write_clock(BIT(data, 5));
 }
 
 u8 vt36x_tetrtin_state::pixel_prot_r()
@@ -612,14 +612,14 @@ void vt36x_tetrtin_state::nesvt270_prot_w(u8 data)
 
 void vt36x_otrail_state::otrail_seeprom_w(u8 data)
 {
-	m_i2cmem->write_scl((data & 0x04) ? true : false);
-	m_i2cmem->write_sda((data & 0x08) ? true : false);
+	m_i2cmem->write_scl(BIT(data, 2));
+	m_i2cmem->write_sda(BIT(data, 3));
 }
 
 void vt36x_otrail_state::otrail_sound_w(u8 data)
 {
 	// is this really a DAC?
-	// 
+	//
 	// it might be an another chip playing samples from an internal ROM
 	// as there are longer sound clips and only short bursts of writes that
 	// look more like commands
@@ -1314,7 +1314,7 @@ ROM_START( lxcap )
 
 	//ROM_REGION( 0x100, "protection", 0 ) // data from additional 8-pin chip for protection
 	// This table is just (0x100 - offset) & 0xff with a nibble swap applied at the end
-	// 
+	//
 	// The chip here (which is accessed in a different way to gtct885 etc.) might not
 	// be fetching data from a table, but doing a calculation
 	//
@@ -1508,7 +1508,7 @@ ROM_START( goretrop )
 	ROM_REGION( 0x100, "protection", 0 ) // data from additional 8-pin chip for protection (copied to 0x701 - 0x7ff)
 	// This is a hacked version of the data from gtct885, as the 'jump from ROM' offsets seem to match, but the
 	// code needs to be at a different address, and some of the ports read/written by the code are different too
-	// 
+	//
 	// This is functional enough to get the menu running, but the real data still needs extracting.
 	ROM_LOAD( "protection.bin", 0x00000, 0x100, BAD_DUMP CRC(3cd42234) SHA1(3a4afc890d894b4256960150b2729fd5f93555a0) )
 ROM_END
@@ -1828,7 +1828,7 @@ CONS( 201?, red5mam,  0,  0,  vt36x_altswap_32mb_4banks_red5mam, vt369, vt36x_st
 
 CONS( 2016, dgun2593,  0,  0,  vt36x_altswap_32mb_4banks_red5mam, vt369, vt36x_state, empty_init, "dreamGEAR", "My Arcade Retro Arcade Machine - 300 Handheld Video Games (DGUN-2593)", MACHINE_NOT_WORKING )
 
-CONS( 201?, urban240,  0,  0,  vt36x_altswap_32mb_4banks_red5mam, vt369, vt36x_state, empty_init, "Urban Outfitters", "Mini Arcade Machine 240-in-1 (translucent case)", MACHINE_NOT_WORKING ) 
+CONS( 201?, urban240,  0,  0,  vt36x_altswap_32mb_4banks_red5mam, vt369, vt36x_state, empty_init, "Urban Outfitters", "Mini Arcade Machine 240-in-1 (translucent case)", MACHINE_NOT_WORKING )
 
 CONS( 200?, gcs2mgp,   0,  0,  vt36x_altswap_16mb, vt369_rot, vt36x_state, empty_init, "Jungle's Soft", "Mini Game Player 48-in-1",  MACHINE_NOT_WORKING | ROT270 )
 
