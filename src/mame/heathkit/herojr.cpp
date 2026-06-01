@@ -782,8 +782,13 @@ u8 herojr_state::u215_speech_data_r()
 
 u8 herojr_state::u215_speech_power_r()
 {
-	const u8 speech_busy = m_speech_request ? 0x00 : 0x01;
-	return (m_u215_port_b & 0xae) | speech_busy | (m_adc_output_state ? 0x10 : 0x00) | (m_sleep_norm->read() ? 0x40 : 0x00);
+	// PB0 is a CPU-driven port-B bit; the firmware uses it as a software
+	// speech-busy flag (set before a phoneme, cleared by the CA1 ISR) and reads
+	// back its own driven value.  Per the Technical Manual the SC-01 request
+	// line is wired to CA1 (U215-40, $D842 bit 7), NOT to any $D841 bit, so do
+	// not mirror m_speech_request onto PB0 - that fabricates a connection the
+	// hardware does not have and races the firmware's $F067 busy-flag poll.
+	return (m_u215_port_b & 0xaf) | (m_adc_output_state ? 0x10 : 0x00) | (m_sleep_norm->read() ? 0x40 : 0x00);
 }
 
 u8 herojr_state::u215_speech_control_r()
