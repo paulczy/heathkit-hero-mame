@@ -414,8 +414,6 @@ local supported_commands = {
   "press_key",
   "release_key",
   "set_sleep_norm",
-  "save_state",
-  "load_state",
   "initialize_herojr_warm_context",
   "reset_machine"
 }
@@ -1480,15 +1478,6 @@ local function set_sleep_norm(params)
   return { sleepNorm = norm and 1 or 0 }
 end
 
-local function state_file_name(params, command)
-  local file = params and params.file
-  if type(file) ~= "string" or file == "" then
-    error(command .. " requires non-empty file")
-  end
-
-  return file
-end
-
 local function snapshot_address_map(addresses)
   local values = {}
   for addr, _ in pairs(addresses) do
@@ -1524,42 +1513,6 @@ local function bridge_debug_snapshot()
   end
 
   return snapshot
-end
-
-local function save_state(params)
-  local file = state_file_name(params, "save_state")
-  trace("state", "save_state requesting file=" .. file .. " pc=" .. trace_address(get_register("pc")))
-  local ok, result = pcall(function() return manager.machine:save(file) end)
-  trace("state", "save_state machine:save ok=" .. tostring(ok) .. " result=" .. tostring(result))
-  if not ok then
-    error(result)
-  end
-  diagnostic_event("mame:lua:state", "MAME save state completed.", {
-    file = file,
-    result = tostring(result),
-    snapshot = bridge_debug_snapshot()
-  })
-  emu.unpause()
-  cpu_debug():go()
-  return { file = file }
-end
-
-local function load_state(params)
-  local file = state_file_name(params, "load_state")
-  trace("state", "load_state requesting file=" .. file .. " pc=" .. trace_address(get_register("pc")))
-  local ok, result = pcall(function() return manager.machine:load(file) end)
-  trace("state", "load_state machine:load ok=" .. tostring(ok) .. " result=" .. tostring(result))
-  if not ok then
-    error(result)
-  end
-  diagnostic_event("mame:lua:state", "MAME load state completed.", {
-    file = file,
-    result = tostring(result),
-    snapshot = bridge_debug_snapshot()
-  })
-  emu.unpause()
-  cpu_debug():go()
-  return { file = file }
 end
 
 local function bcd(value)
@@ -1811,8 +1764,6 @@ local handlers = {
   press_key = press_key,
   release_key = release_key,
   set_sleep_norm = set_sleep_norm,
-  save_state = save_state,
-  load_state = load_state,
   initialize_herojr_warm_context = initialize_herojr_warm_context,
   reset_machine = reset_machine
 }
