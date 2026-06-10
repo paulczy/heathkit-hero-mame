@@ -172,6 +172,7 @@ if (STANDALONE~=true) then
 	links {
 		ext_lib("lua"),
 		"lualibs",
+		"luasocket",
 		"linenoise",
 	}
 end

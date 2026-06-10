@@ -1048,6 +1048,73 @@ end
 	}
 
 --------------------------------------------------
+-- LuaSocket library objects (vendored C core; see
+-- 3rdparty/luasocket/README-vendored.md — required
+-- transport for the HERO bridge plugin)
+--------------------------------------------------
+
+project "luasocket"
+	uuid "9c1f8c1e-6c3a-4d6b-9a3e-3b1f5b6a2d41"
+	kind "StaticLib"
+
+	-- Compiled as C++ like lualibs: MAME builds its bundled Lua as C++, so
+	-- the Lua API symbols these objects reference are C++-mangled.
+	options {
+		"ForceCPP",
+	}
+
+	configuration { "gmake or ninja" }
+		buildoptions {
+			"-Wno-error",
+		}
+		buildoptions_cpp {
+			"-x c++",
+		}
+
+	configuration { "vs*" }
+if _OPTIONS["vs"]==nil then
+		buildoptions {
+			"/wd4244", -- warning C4244: 'argument' : conversion, possible loss of data
+			"/wd4267", -- warning C4267: conversion from 'size_t', possible loss of data
+		}
+end
+
+	configuration { }
+
+	includedirs {
+		MAME_DIR .. "3rdparty/luasocket/src",
+	}
+
+	includedirs {
+		ext_includedir("lua"),
+	}
+
+	files {
+		MAME_DIR .. "3rdparty/luasocket/src/auxiliar.c",
+		MAME_DIR .. "3rdparty/luasocket/src/buffer.c",
+		MAME_DIR .. "3rdparty/luasocket/src/compat.c",
+		MAME_DIR .. "3rdparty/luasocket/src/except.c",
+		MAME_DIR .. "3rdparty/luasocket/src/inet.c",
+		MAME_DIR .. "3rdparty/luasocket/src/io.c",
+		MAME_DIR .. "3rdparty/luasocket/src/luasocket.c",
+		MAME_DIR .. "3rdparty/luasocket/src/options.c",
+		MAME_DIR .. "3rdparty/luasocket/src/select.c",
+		MAME_DIR .. "3rdparty/luasocket/src/tcp.c",
+		MAME_DIR .. "3rdparty/luasocket/src/timeout.c",
+		MAME_DIR .. "3rdparty/luasocket/src/udp.c",
+	}
+
+if _OPTIONS["targetos"]=="windows" then
+	files {
+		MAME_DIR .. "3rdparty/luasocket/src/wsocket.c",
+	}
+else
+	files {
+		MAME_DIR .. "3rdparty/luasocket/src/usocket.c",
+	}
+end
+
+--------------------------------------------------
 -- SQLite3 library objects
 --------------------------------------------------
 

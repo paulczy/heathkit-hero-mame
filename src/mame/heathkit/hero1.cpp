@@ -674,7 +674,8 @@ void hero1_state::port_c2c0_select_strobe_w(u8 data)
 	const u8 previous_strobe = m_speech_strobe_state;
 	m_speech_strobe_state = BIT(data, 5) ? 1 : 0;
 	m_speech_strobe = m_speech_strobe_state;
-	driver_tracef("port_c2c0_select_strobe_w data=$%02X clock_address=$%01X strobe=%u previous_strobe=%u", data, m_clock_address, m_speech_strobe_state, previous_strobe);
+	if (m_speech_strobe_state != previous_strobe)
+		driver_tracef("port_c2c0_select_strobe_w data=$%02X clock_address=$%01X strobe=%u previous_strobe=%u pc=$%04X", data, m_clock_address, m_speech_strobe_state, previous_strobe, m_maincpu->pc() & 0xffff);
 	if (!previous_strobe && m_speech_strobe_state)
 		latch_speech_phoneme();
 	reassert_level_interrupts();
@@ -751,7 +752,7 @@ void hero1_state::speech_request_w(int state)
 {
 	m_speech_request = state ? 1 : 0;
 	m_speech_ready = m_speech_request;
-	driver_tracef("speech_request_w state=%d ready=%u", state, m_speech_request);
+	driver_tracef("speech_request_w state=%d ready=%u pc=$%04X", state, m_speech_request, m_maincpu->pc() & 0xffff);
 }
 
 void hero1_state::set_speech_data(u8 data)

@@ -49,6 +49,7 @@ int luaopen_zlib(lua_State *const L);
 extern "C" int luaopen_lfs(lua_State *L);
 int luaopen_linenoise(lua_State *L);
 int luaopen_lsqlite3(lua_State *L);
+int luaopen_socket_core(lua_State *L); // vendored LuaSocket (built as C++ like lualibs); required by the HERO bridge plugin transport
 
 
 template <typename T>
@@ -495,6 +496,7 @@ lua_engine::lua_engine()
 	sol()["package"]["preload"]["lfs"] = &luaopen_lfs;
 	sol()["package"]["preload"]["linenoise"] = &luaopen_linenoise;
 	sol()["package"]["preload"]["lsqlite3"] = &luaopen_lsqlite3;
+	sol()["package"]["preload"]["socket.core"] = &luaopen_socket_core;
 
 	lua_gc(m_lua_state, LUA_GCRESTART, 0);
 }

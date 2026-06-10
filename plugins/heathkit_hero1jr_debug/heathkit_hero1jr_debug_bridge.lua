@@ -3,98 +3,56 @@
 
 local bridge = {}
 
-local socket_ok, socket = pcall(require, "socket")
-
-local function make_emu_file_socket_module()
-  local module = {}
-
-  function module.bind(bind_host, bind_port)
-    local function create_client()
-      local file = emu.file("", 7)
-      file:open("socket." .. bind_host .. ":" .. tostring(bind_port))
-
-      local client = {
-        buffer = "",
-        closed = false
-      }
-
-      function client:settimeout(_timeout)
-      end
-
-      function client:send(data)
-        file:write(data)
-        return #data
-      end
-
-      function client:receive(pattern)
-        if self.closed then
-          return nil, "closed"
-        end
-
-        if pattern ~= "*l" then
-          error("emu.file socket fallback only supports line reads")
-        end
-
-        local newline = self.buffer:find("\n", 1, true)
-        if newline then
-          local line = self.buffer:sub(1, newline - 1):gsub("\r$", "")
-          self.buffer = self.buffer:sub(newline + 1)
-          return line
-        end
-
-        local chunk = file:read(4096)
-        if chunk and #chunk > 0 then
-          self.buffer = self.buffer .. chunk
-          newline = self.buffer:find("\n", 1, true)
-          if newline then
-            local line = self.buffer:sub(1, newline - 1):gsub("\r$", "")
-            self.buffer = self.buffer:sub(newline + 1)
-            return line
-          end
-        end
-
-        return nil, "timeout"
-      end
-
-      function client:close()
-        self.closed = true
-        file:close()
-      end
-
-      return client
-    end
-
-    local server = {
-      client = nil
-    }
-
-    function server:settimeout(_timeout)
-    end
-
-    function server:accept()
-      if self.client and not self.client.closed then
-        return nil
-      end
-
-      self.client = create_client()
-      return self.client
-    end
-
-    function server:close()
-      if self.client then
-        self.client:close()
-        self.client = nil
-      end
-    end
-
-    return server
-  end
-
-  return module
+-- Transport: the vendored LuaSocket core, preloaded by the fork's
+-- luaengine.cpp as "socket.core". It is REQUIRED — a missing module means
+-- the plugin is running against a non-fork or stale engine build, and the
+-- bridge must refuse loudly instead of degrading (the old emu.file fallback
+-- transport was behind the historical contention/race problems and has been
+-- deleted; there is exactly one transport).
+local socket_core_ok, socket_core = pcall(require, "socket.core")
+if not socket_core_ok then
+  local message = "heathkit_hero1jr_debug: FATAL: required LuaSocket transport (socket.core) is unavailable: "
+    .. tostring(socket_core)
+    .. " — the bundled MAME fork preloads it in luaengine.cpp; rebuild/re-vendor the engine (docs/building-mame-and-vsix.md)"
+  emu.print_error(message)
+  error(message, 0)
 end
 
-if not socket_ok then
-  socket = make_emu_file_socket_module()
+-- socket.core exposes the raw TCP master object; bind/listen explicitly
+-- (the pure-Lua socket.bind convenience wrapper is intentionally not
+-- vendored). tcp4() is required, not tcp(): the AF_UNSPEC master defers fd
+-- creation to bind time, so setoption before bind would be a silent no-op
+-- on an invalid descriptor. reuseaddr is needed for immediate rebind after
+-- a MAME-side active close leaves the port in TIME_WAIT (POSIX; G0-06);
+-- the win32 tradeoff (SO_REUSEADDR permits a same-user double bind) is
+-- accepted because the product serializes sessions and the conformance
+-- runner preflights the port.
+local function bind_tcp_server(bind_host, bind_port)
+  local server, create_err = socket_core.tcp4()
+  if not server then
+    error("heathkit_hero1jr_debug: failed to create bridge TCP socket: " .. tostring(create_err), 0)
+  end
+
+  local option_ok, option_err = server:setoption("reuseaddr", true)
+  if not option_ok then
+    server:close()
+    error("heathkit_hero1jr_debug: failed to set bridge socket reuseaddr: " .. tostring(option_err), 0)
+  end
+
+  local bind_ok, bind_err = server:bind(bind_host, bind_port)
+  if not bind_ok then
+    server:close()
+    error("heathkit_hero1jr_debug: failed to bind bridge socket on "
+      .. bind_host .. ":" .. tostring(bind_port) .. ": " .. tostring(bind_err), 0)
+  end
+
+  local listen_ok, listen_err = server:listen(1)
+  if not listen_ok then
+    server:close()
+    error("heathkit_hero1jr_debug: failed to listen on bridge socket: " .. tostring(listen_err), 0)
+  end
+
+  return server
 end
 
 local function parse_trace_categories(value)
@@ -745,16 +703,55 @@ local function decode_json(text)
   return result
 end
 
+-- Nonblocking LuaSocket send can deliver a prefix and return "timeout";
+-- dropping the remainder would corrupt the NDJSON stream mid-line. Drain
+-- with a short bound instead (os.clock: CPU time, which this hot retry
+-- loop accrues continuously, so the bound terminates): a healthy peer
+-- empties a loopback buffer immediately, and a peer wedged past the bound
+-- is dead — error out so the caller's pcall closes the client rather than
+-- ever sending a torn line.
+local SEND_DRAIN_DEADLINE_SECONDS = 2.0
+
+local function send_all(client, payload)
+  local first = 1
+  local deadline = os.clock() + SEND_DRAIN_DEADLINE_SECONDS
+  while true do
+    local sent, err, last_sent = client:send(payload, first)
+    if sent then
+      return
+    end
+    if err ~= "timeout" then
+      error("bridge client send failed: " .. tostring(err))
+    end
+    first = (last_sent or (first - 1)) + 1
+    if os.clock() > deadline then
+      error("bridge client send stalled (peer not draining); dropping client")
+    end
+  end
+end
+
 local function send_line(client, value)
-  client:send(encode_json(value) .. "\n")
+  send_all(client, encode_json(value) .. "\n")
+end
+
+-- Single removal path: close, drop the receive buffer, and remove by
+-- identity (an index captured before a nested removal can go stale).
+local function drop_client(client)
+  pcall(function() client:close() end)
+  receive_buffers[client] = nil
+  for index, candidate in ipairs(clients) do
+    if candidate == client then
+      table.remove(clients, index)
+      return
+    end
+  end
 end
 
 local function broadcast_event(name, payload)
-  for i = #clients, 1, -1 do
-    local ok = pcall(send_line, clients[i], { event = name, payload = payload or {} })
+  for _, client in ipairs({ table.unpack(clients) }) do
+    local ok = pcall(send_line, client, { event = name, payload = payload or {} })
     if not ok then
-      clients[i]:close()
-      table.remove(clients, i)
+      drop_client(client)
     end
   end
 end
@@ -1768,41 +1765,43 @@ local handlers = {
   reset_machine = reset_machine
 }
 
+-- Returns false when the client's socket is no longer writable (the caller
+-- closes and drops it); a torn response line must never stay half-sent.
 local function handle_request(client, line)
   local ok, request = pcall(decode_json, line)
   if not ok then
-    send_line(client, { id = 0, ok = false, error = tostring(request) })
-    return
+    return pcall(send_line, client, { id = 0, ok = false, error = tostring(request) })
   end
 
   local handler = handlers[request.cmd]
   if not handler then
-    send_line(client, { id = request.id, ok = false, error = "unsupported command: " .. tostring(request.cmd) })
-    return
+    return pcall(send_line, client, { id = request.id, ok = false, error = "unsupported command: " .. tostring(request.cmd) })
   end
 
   trace("request #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " pc=" .. trace_address(get_register("pc")))
   local success, result = xpcall(function() return handler(request.params or {}) end, debug.traceback)
   if success then
     trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " ok")
-    send_line(client, { id = request.id, ok = true, result = result or {} })
-  else
-    trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " failed: " .. tostring(result))
-    diagnostic_event("mame:lua:rpc-error", "Lua bridge request failed.", {
-      id = request.id,
-      cmd = request.cmd,
-      error = tostring(result),
-      snapshot = bridge_debug_snapshot()
-    })
-    send_line(client, { id = request.id, ok = false, error = tostring(result) })
+    return pcall(send_line, client, { id = request.id, ok = true, result = result or {} })
   end
+
+  trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " failed: " .. tostring(result))
+  diagnostic_event("mame:lua:rpc-error", "Lua bridge request failed.", {
+    id = request.id,
+    cmd = request.cmd,
+    error = tostring(result),
+    snapshot = bridge_debug_snapshot()
+  })
+  return pcall(send_line, client, { id = request.id, ok = false, error = tostring(result) })
 end
 
 local function poll_client(client)
   while true do
     local line, err, partial = client:receive("*l")
     if line then
-      handle_request(client, line)
+      if not handle_request(client, line) then
+        return false
+      end
     elseif err == "timeout" then
       if partial and #partial > 0 then
         receive_buffers[client] = (receive_buffers[client] or "") .. partial
@@ -1816,10 +1815,55 @@ local function poll_client(client)
   end
 end
 
+-- The TCP listener binds at plugin start, long before the machine finishes
+-- initializing. Serving a request in that window hits nil devices/debugger,
+-- or worse: writes that machine_reset() then silently wipes (measured
+-- 2026-06-10: pre-reset set_sensor injections reverted to defaults). Serve
+-- only once the machine is genuinely ready — the same predicate the
+-- autostart path waits on — and print the "bridge listening" gate line at
+-- that moment, since that line is the readiness contract the extension and
+-- harness gate on. Earlier connects sit unanswered in the listen backlog.
+local bridge_serving = false
+local bridge_no_debugger_polls = 0
+
+local function bridge_ready_to_serve()
+  if not server then
+    -- The machine-stop notifier closed the listener (in-process machine
+    -- restart). Never re-assert the gate line with nothing listening.
+    return false
+  end
+  if not manager.machine then
+    return false
+  end
+  if not program_space_available() then
+    return false
+  end
+  if not cpu_debug_available() then
+    -- The program space exists but the debugger does not: either a transient
+    -- init window (clears within a few frames) or a launch without -debug.
+    -- Report the latter once, loudly, instead of leaving the gate line absent
+    -- with no explanation.
+    bridge_no_debugger_polls = bridge_no_debugger_polls + 1
+    if bridge_no_debugger_polls == 240 then
+      emu.print_error(log_prefix() .. ": bridge requires the MAME debugger and will not serve; relaunch with -debug")
+    end
+    return false
+  end
+  return true
+end
+
 local function poll()
   if herojr_initial_sleep_pending and set_herojr_sleep_norm_field(false) then
     herojr_initial_sleep_pending = false
     emu.print_info(log_prefix() .. ": initialized HERO Jr Sleep/Norm switch to Sleep")
+  end
+
+  if not bridge_serving then
+    if not bridge_ready_to_serve() then
+      return
+    end
+    bridge_serving = true
+    emu.print_info(log_prefix() .. ": bridge listening on " .. host .. ":" .. tostring(port) .. " via LuaSocket")
   end
 
   if pending_herojr_reset_release_frames > 0 then
@@ -1849,14 +1893,19 @@ local function poll()
       end
       client:settimeout(0)
       clients[#clients + 1] = client
-      send_line(client, { event = "ready", payload = { system = system_name(), profile = profile_name(), systemDescription = system_description(), pc = hex_pc() } })
+      -- Protected: an instant-RST client must not abort the poll tick.
+      if not pcall(send_line, client, { event = "ready", payload = { system = system_name(), profile = profile_name(), systemDescription = system_description(), pc = hex_pc() } }) then
+        drop_client(client)
+      end
     end
   end
 
-  for i = #clients, 1, -1 do
-    if not poll_client(clients[i]) then
-      clients[i]:close()
-      table.remove(clients, i)
+  -- Reap by identity, never by captured index: a mid-handler broadcast can
+  -- remove entries from `clients` while this loop runs, so a stale index
+  -- would close an innocent client.
+  for _, client in ipairs({ table.unpack(clients) }) do
+    if not poll_client(client) then
+      drop_client(client)
     end
   end
 
@@ -1938,11 +1987,13 @@ local function poll()
 end
 
 function bridge.start()
-  server = assert(socket.bind(host, port))
+  server = bind_tcp_server(host, port)
   server:settimeout(0)
   emu.register_periodic(poll)
   emu.register_frame_done(poll)
   subscriptions[#subscriptions + 1] = emu.add_machine_stop_notifier(function()
+    bridge_serving = false
+    bridge_no_debugger_polls = 0
     for _, client in ipairs(clients) do
       client:close()
     end
@@ -1952,8 +2003,9 @@ function bridge.start()
       server = nil
     end
   end)
-  local transport = socket_ok and "LuaSocket" or "emu.file"
-  emu.print_info(log_prefix() .. ": bridge listening on " .. host .. ":" .. tostring(port) .. " via " .. transport)
+  -- The "bridge listening" gate line is printed by poll() once the machine
+  -- is ready to serve, not here: at this point requests would still fail or
+  -- be wiped by machine_reset.
 end
 
 return bridge
