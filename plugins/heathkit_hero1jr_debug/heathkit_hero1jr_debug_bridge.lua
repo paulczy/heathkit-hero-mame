@@ -1960,11 +1960,10 @@ local function poll()
         })
         pcall(function() client:close() end)
       else
+        -- No greeting event: the protocol's readiness contract is the
+        -- client's own request/response round trip (the old `ready` event
+        -- proved nothing a client could rely on and was deleted).
         clients[#clients + 1] = client
-        -- Protected: an instant-RST client must not abort the poll tick.
-        if not pcall(send_line, client, { event = "ready", payload = { system = system_name(), profile = profile_name(), systemDescription = system_description(), pc = hex_pc() } }) then
-          drop_client(client)
-        end
       end
     end
   end
