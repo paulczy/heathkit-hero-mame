@@ -507,7 +507,16 @@ local function hex_pc()
   return string.format("%04X", get_register("pc") & 0xffff)
 end
 
+-- Explicit JSON null for table fields (a plain nil value would simply drop
+-- the key). Used for protocol-level errors that correlate to no request id:
+-- real request ids are numbers (the product client starts at 1), so id:null
+-- can never collide with a pending request.
+local json_null = setmetatable({}, { __tostring = function() return "null" end })
+
 local function encode_json(value)
+  if value == json_null then
+    return "null"
+  end
   local value_type = type(value)
   if value_type == "nil" then
     return "null"
@@ -734,11 +743,16 @@ local function send_line(client, value)
   send_all(client, encode_json(value) .. "\n")
 end
 
--- Single removal path: close, drop the receive buffer, and remove by
+-- Single removal path: close, drop per-client framing state, and remove by
 -- identity (an index captured before a nested removal can go stale).
+local drop_framing_state
+
 local function drop_client(client)
   pcall(function() client:close() end)
   receive_buffers[client] = nil
+  if drop_framing_state then
+    drop_framing_state(client)
+  end
   for index, candidate in ipairs(clients) do
     if candidate == client then
       table.remove(clients, index)
@@ -1769,20 +1783,24 @@ local handlers = {
 -- closes and drops it); a torn response line must never stay half-sent.
 local function handle_request(client, line)
   local ok, request = pcall(decode_json, line)
-  if not ok then
-    return pcall(send_line, client, { id = 0, ok = false, error = tostring(request) })
+  if not ok or type(request) ~= "table" then
+    -- No trustworthy request id exists in a line that failed to parse;
+    -- id:null marks the error as request-uncorrelated (never id 0, which a
+    -- client could legitimately use).
+    local reason = ok and "request must be a JSON object" or tostring(request)
+    return pcall(send_line, client, { id = json_null, ok = false, error = reason })
   end
 
   local handler = handlers[request.cmd]
   if not handler then
-    return pcall(send_line, client, { id = request.id, ok = false, error = "unsupported command: " .. tostring(request.cmd) })
+    return pcall(send_line, client, { id = request.id or json_null, ok = false, error = "unsupported command: " .. tostring(request.cmd) })
   end
 
   trace("request #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " pc=" .. trace_address(get_register("pc")))
   local success, result = xpcall(function() return handler(request.params or {}) end, debug.traceback)
   if success then
     trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " ok")
-    return pcall(send_line, client, { id = request.id, ok = true, result = result or {} })
+    return pcall(send_line, client, { id = request.id or json_null, ok = true, result = result or {} })
   end
 
   trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " failed: " .. tostring(result))
@@ -1792,19 +1810,58 @@ local function handle_request(client, line)
     error = tostring(result),
     snapshot = bridge_debug_snapshot()
   })
-  return pcall(send_line, client, { id = request.id, ok = false, error = tostring(result) })
+  return pcall(send_line, client, { id = request.id or json_null, ok = false, error = tostring(result) })
+end
+
+-- A single NDJSON line is bounded: the largest legitimate request is a
+-- write_mem of a few KB. Past this cap the line is discarded to its
+-- terminating newline and answered with one id:null error instead of
+-- growing the buffer without bound.
+local MAX_REQUEST_LINE_BYTES = 256 * 1024
+local oversized_discard = {}
+
+drop_framing_state = function(client)
+  oversized_discard[client] = nil
 end
 
 local function poll_client(client)
   while true do
     local line, err, partial = client:receive("*l")
     if line then
-      if not handle_request(client, line) then
-        return false
+      if oversized_discard[client] then
+        -- This line is the tail of a discarded oversized line; drop it and
+        -- report once, then resume normal framing.
+        oversized_discard[client] = nil
+        local sent = pcall(send_line, client, {
+          id = json_null,
+          ok = false,
+          error = "request line exceeded " .. tostring(MAX_REQUEST_LINE_BYTES) .. " bytes and was discarded"
+        })
+        if not sent then
+          return false
+        end
+      else
+        -- G0-05 split-line framing: a request that arrived across TCP
+        -- segments accumulated its prefix in receive_buffers; the newline
+        -- completes it here.
+        local prefix = receive_buffers[client]
+        if prefix then
+          line = prefix .. line
+          receive_buffers[client] = nil
+        end
+        if not handle_request(client, line) then
+          return false
+        end
       end
     elseif err == "timeout" then
-      if partial and #partial > 0 then
-        receive_buffers[client] = (receive_buffers[client] or "") .. partial
+      if partial and #partial > 0 and not oversized_discard[client] then
+        local buffered = (receive_buffers[client] or "") .. partial
+        if #buffered > MAX_REQUEST_LINE_BYTES then
+          receive_buffers[client] = nil
+          oversized_discard[client] = true
+        else
+          receive_buffers[client] = buffered
+        end
       end
       return true
     elseif err == "closed" then
@@ -1892,10 +1949,22 @@ local function poll()
         break
       end
       client:settimeout(0)
-      clients[#clients + 1] = client
-      -- Protected: an instant-RST client must not abort the poll tick.
-      if not pcall(send_line, client, { event = "ready", payload = { system = system_name(), profile = profile_name(), systemDescription = system_description(), pc = hex_pc() } }) then
-        drop_client(client)
+      if #clients >= 1 then
+        -- G0-04 single-client bridge: the second concurrent client is
+        -- actively refused — an explicit error line, then a deliberate
+        -- close — while the first client stays served.
+        pcall(send_line, client, {
+          id = json_null,
+          ok = false,
+          error = "bridge already has an active client; the HERO bridge is single-client"
+        })
+        pcall(function() client:close() end)
+      else
+        clients[#clients + 1] = client
+        -- Protected: an instant-RST client must not abort the poll tick.
+        if not pcall(send_line, client, { event = "ready", payload = { system = system_name(), profile = profile_name(), systemDescription = system_description(), pc = hex_pc() } }) then
+          drop_client(client)
+        end
       end
     end
   end
@@ -1998,6 +2067,8 @@ function bridge.start()
       client:close()
     end
     clients = {}
+    receive_buffers = {}
+    oversized_discard = {}
     if server then
       server:close()
       server = nil
