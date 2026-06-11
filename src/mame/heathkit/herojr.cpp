@@ -1126,7 +1126,12 @@ DEVICE_INPUT_DEFAULTS_END
 
 void herojr_state::herojr(machine_config &config)
 {
-	M6808(config, m_maincpu, 3.579545_MHz_XTAL);
+	// JR-TM printed p. 24: "The 4 MHz frequency of crystal Y201 is divided
+	// by four inside U201" — E = 1 MHz (the MAME M6808 device performs that
+	// divide-by-four on its input clock). Corroborated by the printed-p. 6
+	// specifications, parts list Y201 = 404-536 (4 MHz crystal), and the
+	// JR-SCH CPU board sheet 3 "4MEGHZ" label at Y201.
+	M6808(config, m_maincpu, 4_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &herojr_state::mem_map);
 
 	// Documented socket populations only (JR-TM pp. 43-44): "2K" = stock
