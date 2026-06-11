@@ -1465,18 +1465,20 @@ end
 local function press_key(params)
   local key = assert(params.key, "press_key requires key")
   keypad_state[key] = true
-  local mapping = key_map[key]
+  local mapping = system_name() == "hero1" and key_map[key] or nil
   if mapping then
     keypad_columns[mapping.column] = keypad_columns[mapping.column] & (~mapping.bit & 0x3f)
     write_keypad_column(mapping.column)
   end
   if system_name() == "herojr" then
+    -- Ioport fields only (G1J-03): the same input path a human keypress
+    -- takes. The driver's matrix read derives held keys from these fields;
+    -- the old $D820 write-sniffing side channel is deleted.
     if key == "RESET" then
       set_herojr_reset_field(true)
     else
       set_herojr_keypad_field(key, true)
     end
-    write_u8(0xd820, herojr_keypad_byte())
   end
   broadcast_io_changed(true)
   return {}
@@ -1485,7 +1487,7 @@ end
 local function release_key(params)
   local key = assert(params.key, "release_key requires key")
   keypad_state[key] = nil
-  local mapping = key_map[key]
+  local mapping = system_name() == "hero1" and key_map[key] or nil
   if mapping then
     keypad_columns[mapping.column] = (keypad_columns[mapping.column] | mapping.bit) & 0x3f
     write_keypad_column(mapping.column)
@@ -1496,7 +1498,6 @@ local function release_key(params)
     else
       set_herojr_keypad_field(key, false)
     end
-    write_u8(0xd820, 0xfe)
   end
   broadcast_io_changed(true)
   return {}
@@ -1710,17 +1711,20 @@ local function reset_machine(params)
   if not preserve_herojr_keys then
     keypad_state = {}
     keypad_columns = { 0x3f, 0x3f, 0x3f }
-    write_keypad_column(1)
-    write_keypad_column(2)
-    write_keypad_column(3)
+    if system_name() == "hero1" then
+      write_keypad_column(1)
+      write_keypad_column(2)
+      write_keypad_column(3)
+    end
     if system_name() == "herojr" then
+      -- Ioport fields only; held fields naturally survive a machine reset,
+      -- which is exactly what preserveKeys relies on.
       for key, _ in pairs(key_map) do
         set_herojr_keypad_field(key, false)
       end
       for key = 0, 15 do
         set_herojr_keypad_field(string.format("%X", key), false)
       end
-      write_u8(0xd820, 0xfe)
     end
   end
   if system_name() == "herojr" then
@@ -1731,9 +1735,6 @@ local function reset_machine(params)
     end
     write_u8(herojr_sensor_base + 0x03, 0)
     pending_herojr_reset_release_frames = 2
-    if preserve_herojr_keys then
-      write_u8(0xd820, herojr_keypad_byte())
-    end
   else
     manager.machine:soft_reset()
   end

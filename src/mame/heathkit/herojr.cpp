@@ -108,8 +108,6 @@ private:
 	u8 rtc_r(offs_t offset);
 	u8 u214_port_a_r();
 	u8 keypad_matrix_r();
-	static bool is_keypad_bridge_press(u8 data);
-	static bool is_keypad_bridge_release(u8 data);
 	u8 u214_port_b_r();
 	void u214_port_a_w(u8 data);
 	void u214_port_b_w(u8 data);
@@ -212,7 +210,6 @@ private:
 	output_finder<8> m_port_outputs;
 
 	u8 m_u214_port_a = 0xff;
-	u8 m_keypad_bridge_byte = 0xff;
 	u8 m_u214_port_b = 0xff;
 	u8 m_u214_control_a = 0;
 	u8 m_u214_control_b = 0;
@@ -284,7 +281,6 @@ void herojr_state::machine_start()
 	driver_tracef("machine_start trace enabled initial_sleep=%s", initial_sleep ? initial_sleep : "");
 
 	save_item(NAME(m_u214_port_a));
-	save_item(NAME(m_keypad_bridge_byte));
 	save_item(NAME(m_u214_port_b));
 	save_item(NAME(m_u214_control_a));
 	save_item(NAME(m_u214_control_b));
@@ -348,7 +344,6 @@ void herojr_state::reset_interface_state()
 	m_u215->reset();
 
 	m_u214_port_a = 0xff;
-	m_keypad_bridge_byte = 0xff;
 	m_u214_port_b = 0x00;
 	m_u214_control_a = 0;
 	m_u214_control_b = 0;
@@ -545,15 +540,18 @@ void herojr_state::rtc_w(offs_t offset, u8 data)
 u8 herojr_state::u214_port_a_r()
 {
 	const u8 data = keypad_matrix_r();
-	driver_tracef("u214_port_a_r data=$%02X port_a=$%02X keypad_bridge=$%02X wheel_feedback=%u feedback_count=%u", data, m_u214_port_a, m_keypad_bridge_byte, m_wheel_feedback_sample, m_wheel_feedback_port_a_count);
+	driver_tracef("u214_port_a_r data=$%02X port_a=$%02X wheel_feedback=%u feedback_count=%u", data, m_u214_port_a, m_wheel_feedback_sample, m_wheel_feedback_port_a_count);
 	return data;
 }
 
+// JR-TM p. 24: 4x4 active-low matrix on $D820 D0-D7 (columns D0-D3, rows
+// D4-D7). The ROM scans by writing drive patterns and reading back ($D1C5
+// in v1.6: $F0, $0F, then $FF with XOR detection); a held key — sourced
+// ONLY from the ioport fields — reflects each driven-low line onto its
+// crossing line. Bridge key injection sets the same ioport fields a human
+// keypress sets; there is no other injection channel.
 u8 herojr_state::keypad_matrix_r()
 {
-	if (is_keypad_bridge_press(m_keypad_bridge_byte) && m_u214_port_a == 0xff)
-		return m_keypad_bridge_byte;
-
 	u8 data = m_u214_port_a;
 	for (int row = 0; row < 4; row++)
 	{
@@ -562,8 +560,7 @@ u8 herojr_state::keypad_matrix_r()
 		for (int column = 0; column < 4; column++)
 		{
 			const u8 column_line = 1U << column;
-			const bool bridge_pressed = !BIT(m_keypad_bridge_byte, column) && !BIT(m_keypad_bridge_byte, row + 4);
-			if (!BIT(row_bits, column) && !bridge_pressed)
+			if (!BIT(row_bits, column))
 				continue;
 
 			if (!BIT(data, column))
@@ -575,33 +572,6 @@ u8 herojr_state::keypad_matrix_r()
 
 	data &= ~steering_limit_mask();
 	return data;
-}
-
-bool herojr_state::is_keypad_bridge_press(u8 data)
-{
-	int column_count = 0;
-	int row_count = 0;
-	for (int bit = 0; bit < 4; bit++)
-	{
-		if (!BIT(data, bit))
-			column_count++;
-		if (!BIT(data, bit + 4))
-			row_count++;
-	}
-
-	return column_count == 1 && row_count == 1;
-}
-
-bool herojr_state::is_keypad_bridge_release(u8 data)
-{
-	int low_count = 0;
-	for (int bit = 0; bit < 8; bit++)
-	{
-		if (!BIT(data, bit))
-			low_count++;
-	}
-
-	return low_count == 1;
 }
 
 u8 herojr_state::u214_port_b_r()
@@ -679,19 +649,12 @@ void herojr_state::update_drive_sonar_motion()
 	m_sonar_distance_output = m_sonar_distance_sample;
 }
 
+// Pure output-latch write: every byte updates the scan latch, exactly as
+// the ROM's $D1C5 scan routine expects. (The old write-sniffing heuristic
+// that interpreted certain bit patterns as bridge key injections is gone —
+// keys come only from ioport fields.)
 void herojr_state::u214_port_a_w(u8 data)
 {
-	if (is_keypad_bridge_press(data))
-	{
-		m_keypad_bridge_byte = data;
-		return;
-	}
-	if (is_keypad_bridge_release(data))
-	{
-		m_keypad_bridge_byte = 0xff;
-		return;
-	}
-
 	m_u214_port_a = data;
 }
 
