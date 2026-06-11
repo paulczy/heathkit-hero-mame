@@ -816,11 +816,26 @@ local function hero1_hardware_capabilities()
 end
 
 local function herojr_hardware_capabilities()
+  -- Socket population follows the launched configuration (-ramsize): the
+  -- driver publishes top-of-populated-RAM as herojr_ram_top ($07FF stock 2K
+  -- 6116 at U203, image mirrored x4 across the decoded window; $3FFF
+  -- expanded 16K = 8K at U203+U204). Absent sockets are open bus.
+  local ram_top = 0x07ff
+  local ok, value = pcall(function() return manager.machine.output:get_value("herojr_ram_top") end)
+  if ok and type(value) == "number" and value > 0 then
+    ram_top = value
+  end
+  local expanded = ram_top >= 0x3fff
   return {
     memory = {
-      u203 = { startAddress = 0x0000, endAddress = 0x1fff, kind = "ram" },
-      u204 = { startAddress = 0x2000, endAddress = 0x3fff, kind = "ram" },
-      u205 = { startAddress = 0x4000, endAddress = 0x5fff, kind = "ram" },
+      ramTop = ram_top,
+      u203 = expanded
+        and { startAddress = 0x0000, endAddress = 0x1fff, kind = "ram", device = "8Kx8" }
+        or { startAddress = 0x0000, endAddress = 0x1fff, kind = "ram", device = "2Kx8 mirrored x4" },
+      u204 = expanded
+        and { startAddress = 0x2000, endAddress = 0x3fff, kind = "ram", device = "8Kx8" }
+        or { startAddress = 0x2000, endAddress = 0x3fff, kind = "openBus" },
+      u205 = { startAddress = 0x4000, endAddress = 0x5fff, kind = "openBus" },
       u206 = { startAddress = 0x6000, endAddress = 0x7fff, kind = "cartridgeRom", slot = "cartslot" },
       monitorRom = { startAddress = 0x8000, endAddress = 0xffff, ioHoleStart = 0xd800, ioHoleEnd = 0xdfff }
     },

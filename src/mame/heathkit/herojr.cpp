@@ -21,6 +21,7 @@
 #include "machine/6850acia.h"
 #include "machine/clock.h"
 #include "machine/mc146818.h"
+#include "machine/ram.h"
 #include "osdcore.h"
 #include "sound/votrax.h"
 
@@ -51,6 +52,7 @@ public:
 	herojr_state(const machine_config &mconfig, device_type type, const char *tag) :
 		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
+		m_ram(*this, RAM_TAG),
 		m_cart(*this, "cartslot"),
 		m_rtc(*this, "rtc"),
 		m_acia(*this, "acia"),
@@ -89,6 +91,7 @@ public:
 		m_rtc_sqw(*this, "herojr_rtc_sqw"),
 		m_rs232_status_output(*this, "herojr_rs232_status"),
 		m_rs232_data_output(*this, "herojr_rs232_data"),
+		m_ram_top(*this, "herojr_ram_top"),
 		m_port_outputs(*this, "herojr_port_out_%u", 0U)
 	{
 	}
@@ -164,6 +167,7 @@ private:
 	}
 
 	required_device<m6808_cpu_device> m_maincpu;
+	required_device<ram_device> m_ram;
 	required_device<generic_slot_device> m_cart;
 	required_device<mc146818_device> m_rtc;
 	required_device<acia6850_device> m_acia;
@@ -215,6 +219,8 @@ private:
 	output_finder<> m_rtc_sqw;
 	output_finder<> m_rs232_status_output;
 	output_finder<> m_rs232_data_output;
+	// Top of populated RAM ($07FF stock / $3FFF expanded) for bridge truth.
+	output_finder<> m_ram_top;
 	output_finder<8> m_port_outputs;
 
 	u8 m_u214_port_a = 0xff;
@@ -259,6 +265,24 @@ private:
 void herojr_state::machine_start()
 {
 	m_driver_trace = driver_trace_enabled("herojr");
+
+	// Install the documented socket population (see mem_map comment).
+	address_space &program = m_maincpu->space(AS_PROGRAM);
+	if (m_ram->size() == 0x4000)
+	{
+		// Expanded BASIC-era unit: 8K at U203 ($0000-$1FFF) + 8K at U204
+		// ($2000-$3FFF); U205 absent, $4000-$5FFF open bus.
+		program.install_ram(0x0000, 0x3fff, m_ram->pointer());
+	}
+	else
+	{
+		// Stock build: one 2K 6116 at U203; A11/A12 unconnected to the part,
+		// image mirrors 4x across the decoded $0000-$1FFF window.
+		program.install_ram(0x0000, 0x07ff, 0x1800, m_ram->pointer());
+	}
+	m_ram_top.resolve();
+	m_ram_top = (m_ram->size() == 0x4000) ? 0x3fff : 0x07ff;
+
 	m_speech_phoneme.resolve();
 	m_speech_inflection.resolve();
 	m_speech_strobe.resolve();
@@ -455,9 +479,20 @@ INPUT_CHANGED_MEMBER(herojr_state::reset_changed)
 
 void herojr_state::mem_map(address_map &map)
 {
-	map(0x0000, 0x07ff).mirror(0x1800).ram(); // Supplied U203 2K RAM in the decoded $0000-$1FFF memory window
-	map(0x2000, 0x3fff).ram(); // U204 expansion RAM in the decoded $2000-$3FFF memory window
-	map(0x4000, 0x5fff).ram(); // U205 expansion RAM in the decoded $4000-$5FFF memory window
+	// U203/U204/U205 socket population is per documented build option and is
+	// installed in machine_start() from the RAM device size (-ramsize):
+	//   stock    (2K, default): one 6116 at U203 only; U204/U205 ship empty
+	//            (JR-TM appendix printed pp. 43-44, parts list p. 39;
+	//            JR-ILL Pictorial 3-4 "NOT USED").
+	//   expanded (16K): 8K parts at U203+U204 for BASIC-era units; U205 empty
+	//            (RTC-1-8 printed p. 9 pins BASIC's work area above $0800).
+	// The U202 decoder PROM (444-295) selects each socket for its full 8K
+	// window with no per-size qualification — JR-SCH sheet 3: A11/A12 enter
+	// U202 only so U208's select can exclude the $D800-$DFFF I/O hole, and
+	// J201/J203/J205 merely reroute socket pin 23 between A11 (8K part) and
+	// WE* (2K part) — so a 2K part's image repeats 4x across its window and
+	// an absent socket's select drives no device (open bus; modeled as
+	// unmapped, see hardware-notes.md).
 	map(0x6000, 0x7fff).r(m_cart, FUNC(generic_slot_device::read_rom)); // U206 optional cartridge/ROM adapter window
 
 	// HERO Jr Technical Manual address decoder table:
@@ -1093,6 +1128,12 @@ void herojr_state::herojr(machine_config &config)
 {
 	M6808(config, m_maincpu, 3.579545_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &herojr_state::mem_map);
+
+	// Documented socket populations only (JR-TM pp. 43-44): "2K" = stock
+	// 6116 at U203; "16K" = BASIC-era expanded unit, 8K at U203+U204.
+	// The manual-implied maximum (8K in U203/U204/U205 = "24K") is reserved
+	// for an explicit user decision before it becomes an option here.
+	RAM(config, m_ram).set_default_size("2K").set_extra_options("16K");
 
 	MC146818(config, m_rtc, 32.768_kHz_XTAL);
 
