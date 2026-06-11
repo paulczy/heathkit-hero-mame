@@ -105,7 +105,6 @@ private:
 
 	u8 display_memory_r(offs_t offset);
 	void display_memory_w(offs_t offset, u8 data);
-	u8 normalize_display_byte(int digit, u8 data) const;
 	u8 keypad_column0_r();
 	u8 keypad_column1_r();
 	u8 keypad_column2_r();
@@ -355,12 +354,10 @@ void hero1_state::mem_map(address_map &map)
 
 u8 hero1_state::display_memory_r(offs_t offset)
 {
-	const u16 address = 0xc10f + offset;
-	if ((address & 0x000f) != 0x000f)
-		return 0xff;
-
-	const int digit = 6 - ((address >> 4) & 0x07);
-	return (digit >= 0 && digit < 6) ? m_display_memory[digit] : 0xff;
+	// H1-SCH sheet 4: the digit latches U1201-U1206 are 74LS259 addressable
+	// latches (443-804) — write-only devices with no output path onto the
+	// CPU data bus. Reads of the display window are open bus.
+	return 0xff;
 }
 
 void hero1_state::display_memory_w(offs_t offset, u8 data)
@@ -371,38 +368,19 @@ void hero1_state::display_memory_w(offs_t offset, u8 data)
 	if (digit < 0 || digit >= 6)
 		return;
 
-	// On the display board, D0 is the latch data input, A0-A2 select one of
-	// the eight segment outputs, and A4-A6 select U1201-U1206 through U1208.
-	// The monitor also uses the low-nibble-zero address as the completed
-	// character write for OUTCH-visible display bytes.
-	if ((address & 0x000f) == 0x0000)
-	{
-		m_display_memory[digit] = normalize_display_byte(digit, data);
-		m_digits[digit] = m_display_memory[digit];
-		return;
-	}
-
+	// H1-SCH sheet 4, pure 74LS259 semantics (U1201-U1206 via the U1208
+	// 74LS42 digit decode): A0-A2 select one of the eight latch outputs,
+	// D0 is the latched state, and a high output lights the segment. The
+	// monitor's OUTCH ($F7C8) writes sixteen descending addresses per
+	// glyph through a 9-bit rotate; the second pass lands glyph bit j on
+	// segment j exactly, so the accumulated latch state equals the glyph
+	// byte — no whole-byte write port exists on the board.
 	const u8 segment_bit = 1U << (address & 0x07);
 	if (BIT(data, 0))
-		m_display_memory[digit] &= ~segment_bit; // high on D0 turns the selected LED segment off
+		m_display_memory[digit] |= segment_bit;
 	else
-		m_display_memory[digit] |= segment_bit;  // low on D0 turns the selected LED segment on
-}
-
-u8 hero1_state::normalize_display_byte(int digit, u8 data) const
-{
-	// The documented v1.0 power-up readout is "HEro1.O".  The accepted
-	// 444-198 v1.0 image reaches OUTCH with $30 for the final banner glyph,
-	// which is the seven-segment "1" pattern.  Publish the canonical zero/O
-	// glyph for that specific reset banner so bridge-visible output matches
-	// the real front-panel readout without changing general display writes.
-	if (system_bios() == 1 && digit == 5 && data == 0x30 &&
-		m_display_memory[0] == 0x37 && m_display_memory[1] == 0x4f &&
-		m_display_memory[2] == 0x05 && m_display_memory[3] == 0x1d &&
-		m_display_memory[4] == 0xb0)
-		return 0x7e;
-
-	return data;
+		m_display_memory[digit] &= ~segment_bit;
+	m_digits[digit] = m_display_memory[digit];
 }
 
 u8 hero1_state::display_pia_a_r()
