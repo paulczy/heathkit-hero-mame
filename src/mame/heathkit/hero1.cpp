@@ -225,6 +225,19 @@ private:
 void hero1_state::machine_start()
 {
 	m_driver_trace = driver_trace_enabled("hero1");
+
+	// Crystal selection is a board property, not a reset behavior: a v10
+	// board has the base-board Y401 (3.579545 MHz) soldered from power-on.
+	// Select it here — the earliest point where the -bios choice is
+	// resolved (romload assigns system_bios() before devices start) — so
+	// no machine phase ever runs or reports the config-time 4 MHz
+	// placeholder. When this lived in machine_reset(), the Lua bridge
+	// could serve get_capabilities from the startup-screen frame_update
+	// pump (running_machine::run → ui_initialize → video frame_update →
+	// on_periodic) BEFORE the first soft reset applied the v10 crystal:
+	// the G1H-02 1-in-N cpuClockHz = 4,000,000 flake (vsix plan §2.4c).
+	update_cpu_clock();
+
 	m_digits.resolve();
 	m_motor_left.resolve();
 	m_motor_right.resolve();
@@ -271,8 +284,6 @@ void hero1_state::machine_start()
 
 void hero1_state::machine_reset()
 {
-	update_cpu_clock();
-
 	m_display_select = 0;
 	m_display_segments = 0;
 	for (u8 &digit : m_display_memory)
@@ -400,6 +411,14 @@ void hero1_state::display_pia_b_w(u8 data)
 	m_display_select = data & 0x3f;
 }
 
+// BIOS-appropriate crystal (vsix hardware-notes.md §"HERO 1"): v1.0 = the
+// base-board Y401 3.579545 MHz (NTSC colorburst, H1-Tech p79/p103);
+// v1.3/v1.U = 4 MHz, the ET-18-6 Memory Expansion crystal Y101 (pp. 13-14)
+// — those ROMs require the expansion that carries it. Called once from
+// machine_start(): the machine config constructs the CPU before the BIOS
+// selection is knowable, and start time precedes every emulated cycle and
+// every bridge-servable instant, so the selected crystal is in force "from
+// power-on" exactly as on the real board.
 void hero1_state::update_cpu_clock()
 {
 	const bool system_v10 = system_bios() == 1;
