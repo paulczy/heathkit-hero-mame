@@ -516,10 +516,12 @@ u8 herojr_state::rtc_r(offs_t offset)
 	{
 		const u8 address = m_rtc->get_address();
 		const u8 data = m_rtc->data_r();
-		if (address == 0x0a && data == 0xff)
-			return 0x26;
-		if (address == 0x0a)
-			return data & 0x7f;
+		// Erased-NVRAM guard for the ROM's VRT cold/warm decision only.
+		// Register A reads pass through honestly — machine_reset's direct
+		// writes keep it valid, and the device models the real update
+		// cycle, so UIP (bit 7) asserts for 244+1984 us before each 1 Hz
+		// update exactly as the firmware's documented wait expects (G1J-09;
+		// the old unconditional UIP mask is gone).
 		if (address == 0x0d && data == 0xff)
 			return 0x00;
 		return data;

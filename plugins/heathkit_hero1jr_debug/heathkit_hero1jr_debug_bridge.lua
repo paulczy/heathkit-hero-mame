@@ -366,6 +366,7 @@ local supported_commands = {
   "step_in",
   "step_over",
   "step_out",
+  "run_for_ms",
   "get_io_state",
   "set_sensor",
   "press_key",
@@ -1798,6 +1799,27 @@ local handlers = {
   step_out = function()
     focus_maincpu_debugger()
     run_to_step_targets(step_out_targets())
+    return {}
+  end,
+  -- Resume for an exact emulated duration, then stop with a `stopped`
+  -- event (reason "runFor"). The MAME debugger's gtime command provides
+  -- the deterministic emulated-time landing that sub-bridge-latency
+  -- observations (e.g. the MC146818's 2.228 ms UIP window) require; this
+  -- rides the same pending-step plumbing the step commands use.
+  run_for_ms = function(params)
+    local ms = assert(params and params.ms, "run_for_ms requires ms")
+    ms = math.floor(tonumber(ms) or 0)
+    if ms < 1 then
+      error("run_for_ms requires ms >= 1")
+    end
+    trace("run_for_ms request ms=" .. tostring(ms) .. " pc=" .. trace_address(get_register("pc")))
+    focus_maincpu_debugger()
+    clear_temp_step_breakpoints()
+    pending_step_reason = "runFor"
+    pending_step_start_pc = get_register("pc")
+    pending_step_seen_run = false
+    emu.unpause()
+    debugger_manager():command("gtime " .. tostring(ms))
     return {}
   end,
   get_io_state = function() return get_io_state() end,
