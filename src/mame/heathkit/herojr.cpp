@@ -73,6 +73,8 @@ public:
 		m_adc_output(*this, "herojr_adc_output"),
 		m_sonar_echo(*this, "herojr_sonar_echo"),
 		m_sonar_distance_output(*this, "herojr_sonar_distance"),
+		m_sonar_init_time_us(*this, "herojr_sonar_init_time_us"),
+		m_sonar_echo_time_us(*this, "herojr_sonar_echo_time_us"),
 		m_motor_left(*this, "herojr_motor_left"),
 		m_motor_right(*this, "herojr_motor_right"),
 		m_motor_head(*this, "herojr_motor_head"),
@@ -185,6 +187,18 @@ private:
 	output_finder<> m_adc_output;
 	output_finder<> m_sonar_echo;
 	output_finder<> m_sonar_distance_output;
+	// Emulated-time telemetry (µs, masked into the s31 output range so the
+	// double->s32 cast stays defined; wraps after ~35 emulated minutes,
+	// harmless for delta use): G1J-06's 0.9-14.4 ms echo delays are
+	// unresolvable from the host's ~34 ms bridge cadence, so the model
+	// exposes its own INIT/echo stamps.
+	output_finder<> m_sonar_init_time_us;
+	output_finder<> m_sonar_echo_time_us;
+
+	static s32 emulated_time_us(const attotime &now)
+	{
+		return s32(u64(now.as_double() * 1e6) & 0x7fffffff);
+	}
 	output_finder<> m_motor_left;
 	output_finder<> m_motor_right;
 	output_finder<> m_motor_head;
@@ -250,6 +264,8 @@ void herojr_state::machine_start()
 	m_adc_output.resolve();
 	m_sonar_echo.resolve();
 	m_sonar_distance_output.resolve();
+	m_sonar_init_time_us.resolve();
+	m_sonar_echo_time_us.resolve();
 	m_motor_left.resolve();
 	m_motor_right.resolve();
 	m_motor_head.resolve();
@@ -370,6 +386,8 @@ void herojr_state::reset_interface_state()
 	m_adc_output = 0;
 	m_sonar_echo = 0;
 	m_sonar_distance_output = m_sonar_distance_sample;
+	m_sonar_init_time_us = 0;
+	m_sonar_echo_time_us = 0;
 	m_votrax->reset();
 	update_speech_power();
 	m_motor_left = 0;
@@ -987,6 +1005,7 @@ void herojr_state::schedule_sonar_echo()
 	m_sonar_echo_state = 0;
 	m_sonar_echo = 0;
 	m_sonar_distance_output = distance;
+	m_sonar_init_time_us = emulated_time_us(machine().time());
 	driver_tracef("schedule_sonar_echo distance=%u control_b=$%02X port_b=$%02X", distance, m_u214_control_b, m_u214_port_b);
 
 	// The real U307/U308 path measures elapsed echo time.  Keep a deterministic
@@ -1003,6 +1022,7 @@ TIMER_CALLBACK_MEMBER(herojr_state::sonar_echo_tick)
 {
 	m_sonar_echo_state = 1;
 	m_sonar_echo = 1;
+	m_sonar_echo_time_us = emulated_time_us(machine().time());
 }
 
 DEVICE_IMAGE_LOAD_MEMBER(herojr_state::cart_load)

@@ -761,9 +761,20 @@ local function drop_client(client)
   end
 end
 
+-- Observations need machine-time correlation: wall clock cannot resolve
+-- sub-bridge-latency effects (G1J-06 echo delays, G2J-09 phoneme pacing).
+local function emulated_time_seconds()
+  local ok, now = pcall(emu.time)
+  if ok and type(now) == "number" then
+    return now
+  end
+  return 0
+end
+
 local function broadcast_event(name, payload)
+  local stamped = { event = name, payload = payload or {}, emulatedTimeSeconds = emulated_time_seconds() }
   for _, client in ipairs({ table.unpack(clients) }) do
-    local ok = pcall(send_line, client, { event = name, payload = payload or {} })
+    local ok = pcall(send_line, client, stamped)
     if not ok then
       drop_client(client)
     end
@@ -848,6 +859,16 @@ local function hardware_capabilities()
   }
 end
 
+local function cpu_clock_hz()
+  local maincpu = cpu()
+  if not maincpu then
+    return 0
+  end
+  -- device_t::clock(): the configured input clock (the crystal feeding the
+  -- CPU; the M6808 divides by four internally for its E clock).
+  return maincpu.clock or 0
+end
+
 local function get_capabilities()
   return {
     system = system_name(),
@@ -855,6 +876,7 @@ local function get_capabilities()
     systemDescription = system_description(),
     protocolVersion = 1,
     transport = "tcp",
+    cpuClockHz = cpu_clock_hz(),
     commands = supported_commands,
     hardware = hardware_capabilities()
   }
@@ -1024,6 +1046,8 @@ local function get_io_state()
   local herojr_adc_output = output_value(prefix .. "_adc_output")
   local herojr_sonar_echo = output_value(prefix .. "_sonar_echo")
   local herojr_sonar_distance = output_value(prefix .. "_sonar_distance")
+  local herojr_sonar_init_time_us = output_value(prefix .. "_sonar_init_time_us")
+  local herojr_sonar_echo_time_us = output_value(prefix .. "_sonar_echo_time_us")
   local experimental_output = prefix == "hero1" and indexed_output_value(port_prefix, 1) or 0
   local experimental_input = prefix == "hero1" and read_u8(0xc2a0) or 0
   local experimental_interrupt_status = prefix == "hero1" and read_u8(0xc200) or 0
@@ -1197,6 +1221,11 @@ local function get_io_state()
         sonarEcho = herojr_sonar_echo,
         sonarEchoStatus = (herojr_d843 >> 7) & 0x01,
         sonarInit = (herojr_d823 >> 3) & 0x01,
+        -- Driver-model emulated-time telemetry (µs): when INIT scheduled the
+        -- echo and when the echo asserted. Observability only — G1J-06's
+        -- sub-bridge-latency delays cannot be resolved from the host side.
+        sonarInitTimeUs = herojr_sonar_init_time_us,
+        sonarEchoTimeUs = herojr_sonar_echo_time_us,
         motionDetected = herojr_motion_detector,
         motionStatus = (herojr_d821 >> 7) & 0x01
       }
@@ -1779,6 +1808,13 @@ local handlers = {
   reset_machine = reset_machine
 }
 
+-- Every response carries the emulated-time stamp of the moment it was
+-- built, so hosts can correlate command effects with machine time.
+local function send_response(client, response)
+  response.emulatedTimeSeconds = emulated_time_seconds()
+  return pcall(send_line, client, response)
+end
+
 -- Returns false when the client's socket is no longer writable (the caller
 -- closes and drops it); a torn response line must never stay half-sent.
 local function handle_request(client, line)
@@ -1788,19 +1824,19 @@ local function handle_request(client, line)
     -- id:null marks the error as request-uncorrelated (never id 0, which a
     -- client could legitimately use).
     local reason = ok and "request must be a JSON object" or tostring(request)
-    return pcall(send_line, client, { id = json_null, ok = false, error = reason })
+    return send_response(client, { id = json_null, ok = false, error = reason })
   end
 
   local handler = handlers[request.cmd]
   if not handler then
-    return pcall(send_line, client, { id = request.id or json_null, ok = false, error = "unsupported command: " .. tostring(request.cmd) })
+    return send_response(client, { id = request.id or json_null, ok = false, error = "unsupported command: " .. tostring(request.cmd) })
   end
 
   trace("request #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " pc=" .. trace_address(get_register("pc")))
   local success, result = xpcall(function() return handler(request.params or {}) end, debug.traceback)
   if success then
     trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " ok")
-    return pcall(send_line, client, { id = request.id or json_null, ok = true, result = result or {} })
+    return send_response(client, { id = request.id or json_null, ok = true, result = result or {} })
   end
 
   trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " failed: " .. tostring(result))
@@ -1810,7 +1846,7 @@ local function handle_request(client, line)
     error = tostring(result),
     snapshot = bridge_debug_snapshot()
   })
-  return pcall(send_line, client, { id = request.id or json_null, ok = false, error = tostring(result) })
+  return send_response(client, { id = request.id or json_null, ok = false, error = tostring(result) })
 end
 
 -- A single NDJSON line is bounded: the largest legitimate request is a
@@ -1832,7 +1868,7 @@ local function poll_client(client)
         -- This line is the tail of a discarded oversized line; drop it and
         -- report once, then resume normal framing.
         oversized_discard[client] = nil
-        local sent = pcall(send_line, client, {
+        local sent = send_response(client, {
           id = json_null,
           ok = false,
           error = "request line exceeded " .. tostring(MAX_REQUEST_LINE_BYTES) .. " bytes and was discarded"
@@ -1953,7 +1989,7 @@ local function poll()
         -- G0-04 single-client bridge: the second concurrent client is
         -- actively refused — an explicit error line, then a deliberate
         -- close — while the first client stays served.
-        pcall(send_line, client, {
+        send_response(client, {
           id = json_null,
           ok = false,
           error = "bridge already has an active client; the HERO bridge is single-client"

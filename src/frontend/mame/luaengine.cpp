@@ -1576,6 +1576,7 @@ void lua_engine::initialize()
 	device_type["owner"] = sol::property(&device_t::owner);
 	device_type["configured"] = sol::property(&device_t::configured);
 	device_type["started"] = sol::property(&device_t::started);
+	device_type["clock"] = sol::property(static_cast<u32 (device_t::*)() const>(&device_t::clock)); // HERO fork: get_capabilities reports cpuClockHz (G1H-02 crystal clause)
 	device_type["debug"] = sol::property(
 			[] (device_t &dev, sol::this_state s) -> sol::object
 			{
