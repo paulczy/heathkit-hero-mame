@@ -944,8 +944,10 @@ u8 herojr_state::selected_adc_sample() const
 
 void herojr_state::start_adc_conversion()
 {
+	// U306 is an ADC0831 (parts list, Heath 443-1189). A /CS edge arms a
+	// fresh conversion: one leading null bit, then eight data bits.
 	m_adc_shift = selected_adc_sample();
-	m_adc_bits_remaining = 8;
+	m_adc_bits_remaining = 9;
 	m_adc_output_state = 0;
 	m_adc_sample = m_adc_shift;
 	m_adc_output = 0;
@@ -953,11 +955,29 @@ void herojr_state::start_adc_conversion()
 
 void herojr_state::clock_adc_bit()
 {
+	// ADC0831 serial protocol (JR-TM pp. 21-22: successive approximation,
+	// serial, MSB first; ROM reader $EBD9-$EC1D): the first falling clock
+	// edge after /CS emits a leading null (zero), the next eight emit the
+	// sample MSB-first, and past the data the output stays low until the
+	// next /CS — the converter never restarts itself mid-conversion. The
+	// ROM's two discard pulses consume the null and position the MSB for
+	// its read-before-pulse loop.
 	if (m_adc_bits_remaining == 0)
-		start_adc_conversion();
+	{
+		m_adc_output_state = 0;
+		m_adc_output = 0;
+		return;
+	}
 
-	m_adc_output_state = BIT(m_adc_shift, 7) ? 1 : 0;
-	m_adc_shift <<= 1;
+	if (m_adc_bits_remaining == 9)
+	{
+		m_adc_output_state = 0; // leading null bit
+	}
+	else
+	{
+		m_adc_output_state = BIT(m_adc_shift, 7) ? 1 : 0;
+		m_adc_shift <<= 1;
+	}
 	m_adc_bits_remaining--;
 	m_adc_output = m_adc_output_state;
 }
