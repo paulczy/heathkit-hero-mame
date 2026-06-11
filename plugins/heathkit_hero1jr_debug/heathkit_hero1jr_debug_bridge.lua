@@ -97,7 +97,6 @@ local last_io_state_encoded = nil
 local last_io_broadcast_time = 0
 local sensor_state = {
   sonarDistanceInches = 48,
-  sonarHits = 0,
   lightLevel = 50,
   soundLevel = 0,
   motionDetected = false,
@@ -1396,11 +1395,12 @@ local function set_sensor(params)
   local name = assert(params.name, "set_sensor requires name")
   sensor_state[name] = params.value
   if name == "sonarDistanceInches" then
-    sensor_state.sonarHits = (sensor_state.sonarHits + 1) & 0xff
     if system_name() == "hero1" then
+      -- Aperture only. The $D100 write latches the counter byte and raises
+      -- the ROM-visible sonar interrupt; the firmware ISR alone produces
+      -- the readings RAM state ($0010 hit count, $0011 reading) — the
+      -- bridge never writes those addresses (G1H-06).
       write_u8(sensor_base + 0x00, sonar_count_byte_from_inches(params.value))
-      write_u8(0x0010, sensor_state.sonarHits)
-      write_u8(0x0011, sonar_count_byte_from_inches(params.value))
     elseif system_name() == "herojr" then
       write_u8(herojr_sensor_base + 0x02, tonumber(params.value) or 0)
     end
