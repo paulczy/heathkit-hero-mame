@@ -75,6 +75,10 @@ public:
 		m_sonar_distance_output(*this, "herojr_sonar_distance"),
 		m_sonar_init_time_us(*this, "herojr_sonar_init_time_us"),
 		m_sonar_echo_time_us(*this, "herojr_sonar_echo_time_us"),
+		m_phoneme_seq(*this, "herojr_phoneme_seq"),
+		m_phoneme_byte(*this, "herojr_phoneme_byte"),
+		m_phoneme_time_us(*this, "herojr_phoneme_time_us"),
+		m_phoneme_clips(*this, "herojr_phoneme_clips"),
 		m_motor_left(*this, "herojr_motor_left"),
 		m_motor_right(*this, "herojr_motor_right"),
 		m_motor_head(*this, "herojr_motor_head"),
@@ -145,8 +149,6 @@ private:
 	void set_sleep_norm_input(bool norm);
 	void reset_interface_state();
 	void set_reset_line(bool asserted);
-	TIMER_CALLBACK_MEMBER(speech_strobe_clear);
-	TIMER_CALLBACK_MEMBER(speech_request_fallback);
 	TIMER_CALLBACK_MEMBER(rtc_square_wave_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 
@@ -192,6 +194,12 @@ private:
 	// exposes its own INIT/echo stamps.
 	output_finder<> m_sonar_init_time_us;
 	output_finder<> m_sonar_echo_time_us;
+	// Phoneme telemetry (Phase 2.2d): latch sequence counter, latched byte,
+	// emulated-time stamp, and clip counter (latch-while-busy events).
+	output_finder<> m_phoneme_seq;
+	output_finder<> m_phoneme_byte;
+	output_finder<> m_phoneme_time_us;
+	output_finder<> m_phoneme_clips;
 
 	static s32 emulated_time_us(const attotime &now)
 	{
@@ -222,10 +230,13 @@ private:
 	u8 m_u215_port_b = 0;
 	u8 m_u215_control_a = 0;
 	u8 m_u215_control_b = 0;
+	u8 m_u215_ddr_b = 0;
 	u8 m_adc_shift = 0;
 	u8 m_adc_bits_remaining = 0;
 	u8 m_adc_output_state = 0;
 	u8 m_sonar_echo_state = 0;
+	u32 m_phoneme_seq_count = 0;
+	u32 m_phoneme_clip_count = 0;
 	u8 m_wheel_feedback_sample = 0;
 	u16 m_wheel_feedback_port_a_count = 0;
 	u8 m_light_sample = 50;
@@ -241,8 +252,6 @@ private:
 	s16 m_steering_position = 0;
 	u8 m_steering_phase = 0;
 	bool m_driver_trace = false;
-	emu_timer *m_speech_strobe_clear_timer = nullptr;
-	emu_timer *m_speech_request_fallback_timer = nullptr;
 	emu_timer *m_rtc_square_wave_timer = nullptr;
 	emu_timer *m_sonar_echo_timer = nullptr;
 	memory_passthrough_handler m_sleep_loop_tap;
@@ -263,6 +272,10 @@ void herojr_state::machine_start()
 	m_sonar_distance_output.resolve();
 	m_sonar_init_time_us.resolve();
 	m_sonar_echo_time_us.resolve();
+	m_phoneme_seq.resolve();
+	m_phoneme_byte.resolve();
+	m_phoneme_time_us.resolve();
+	m_phoneme_clips.resolve();
 	m_motor_left.resolve();
 	m_motor_right.resolve();
 	m_motor_head.resolve();
@@ -293,10 +306,13 @@ void herojr_state::machine_start()
 	save_item(NAME(m_u215_port_b));
 	save_item(NAME(m_u215_control_a));
 	save_item(NAME(m_u215_control_b));
+	save_item(NAME(m_u215_ddr_b));
 	save_item(NAME(m_adc_shift));
 	save_item(NAME(m_adc_bits_remaining));
 	save_item(NAME(m_adc_output_state));
 	save_item(NAME(m_sonar_echo_state));
+	save_item(NAME(m_phoneme_seq_count));
+	save_item(NAME(m_phoneme_clip_count));
 	save_item(NAME(m_wheel_feedback_sample));
 	save_item(NAME(m_wheel_feedback_port_a_count));
 	save_item(NAME(m_light_sample));
@@ -312,8 +328,6 @@ void herojr_state::machine_start()
 	save_item(NAME(m_steering_position));
 	save_item(NAME(m_steering_phase));
 
-	m_speech_strobe_clear_timer = timer_alloc(FUNC(herojr_state::speech_strobe_clear), this);
-	m_speech_request_fallback_timer = timer_alloc(FUNC(herojr_state::speech_request_fallback), this);
 	m_rtc_square_wave_timer = timer_alloc(FUNC(herojr_state::rtc_square_wave_tick), this);
 	m_sonar_echo_timer = timer_alloc(FUNC(herojr_state::sonar_echo_tick), this);
 	m_sleep_loop_tap = m_maincpu->space(AS_PROGRAM).install_read_tap(
@@ -353,6 +367,7 @@ void herojr_state::reset_interface_state()
 	m_u215_port_b = 0;
 	m_u215_control_a = 0;
 	m_u215_control_b = 0;
+	m_u215_ddr_b = 0;
 	m_adc_shift = 0;
 	m_adc_bits_remaining = 0;
 	m_adc_output_state = 0;
@@ -367,8 +382,6 @@ void herojr_state::reset_interface_state()
 	m_speech_request_flag = 0;
 	m_speech_request_flag_output = 0;
 	m_speech_strobe_state = 0;
-	m_speech_strobe_clear_timer->adjust(attotime::never);
-	m_speech_request_fallback_timer->adjust(attotime::never);
 	m_drive_activity_count = 0;
 	m_steering_position = 0;
 	m_steering_phase = 0;
@@ -383,6 +396,12 @@ void herojr_state::reset_interface_state()
 	m_sonar_distance_output = m_sonar_distance_sample;
 	m_sonar_init_time_us = 0;
 	m_sonar_echo_time_us = 0;
+	m_phoneme_seq_count = 0;
+	m_phoneme_clip_count = 0;
+	m_phoneme_seq = 0;
+	m_phoneme_byte = 0;
+	m_phoneme_time_us = 0;
+	m_phoneme_clips = 0;
 	m_votrax->reset();
 	update_speech_power();
 	m_motor_left = 0;
@@ -765,6 +784,9 @@ u8 herojr_state::u215_speech_data_r()
 
 u8 herojr_state::u215_speech_power_r()
 {
+	if (!BIT(m_u215_control_b, 2))
+		return m_u215_ddr_b;
+
 	// PB0 is a CPU-driven port-B bit; the firmware uses it as a software
 	// speech-busy flag (set before a phoneme, cleared by the CA1 ISR) and reads
 	// back its own driven value.  Per the Technical Manual the SC-01 request
@@ -776,7 +798,14 @@ u8 herojr_state::u215_speech_power_r()
 
 u8 herojr_state::u215_speech_control_r()
 {
-	const u8 visible_request = (m_speech_request_flag && BIT(m_u215_control_a, 0)) ? 0x80 : 0x00;
+	// 6821 datasheet: the IRQA1 flag (CRA bit 7) is set by an active CA1
+	// transition regardless of CRA bit 0 — that bit only enables the IRQ
+	// line. The firmware's POLLED reads must therefore see the request
+	// flag even with interrupts disabled (G1J-07). (Full delegation of
+	// U214/U215 to the instantiated pia6821 devices was evaluated and
+	// deferred: the hand model now matches the datasheet flag semantics,
+	// and wholesale delegation would re-time every port path mid-phase.)
+	const u8 visible_request = m_speech_request_flag ? 0x80 : 0x00;
 	return (m_u215_control_a & 0x3f) | visible_request;
 }
 
@@ -801,6 +830,17 @@ void herojr_state::u215_speech_data_w(u8 data)
 
 void herojr_state::u215_speech_power_w(u8 data)
 {
+	if (!BIT(m_u215_control_b, 2))
+	{
+		// CRB bit 2 selects DDRB; the ROM's only DDR write is the boot
+		// direction byte $EB81 = $2F (PB0-3,5 outputs; PB4,6,7 inputs).
+		// Real init therefore leaves the port B OUTPUT register at $00 —
+		// PB0 clear, speech power off — and the firmware powers the
+		// SC-01 per utterance through its $EF6F helper.
+		m_u215_ddr_b = data;
+		return;
+	}
+
 	const u8 previous_port = m_u215_port_b;
 	m_port_outputs[1] = data;
 	m_u215_port_b = data;
@@ -811,15 +851,12 @@ void herojr_state::u215_speech_power_w(u8 data)
 		start_adc_conversion();
 	if (BIT(previous_port, 5) && !BIT(data, 5))
 		clock_adc_bit();
+	// $D841 D1 switches Q204/Q205 — the AUDIO rail only. R226 maintains
+	// power to U223 itself when they are off and D203 isolates that
+	// maintenance voltage from the amplifier (JR-TM p27), so toggling D1
+	// mutes/unmutes the speaker (update_speech_power gain) and never
+	// resets or stalls the synthesizer's handshake.
 	update_speech_power();
-	if (previous_speech_power && !m_speech_power_state)
-	{
-		m_votrax->reset();
-		m_speech_request = 1;
-		m_speech_request_flag = 0;
-		m_speech_ready = 1;
-		m_speech_request_flag_output = 0;
-	}
 }
 
 void herojr_state::u215_speech_control_w(u8 data)
@@ -832,16 +869,14 @@ void herojr_state::u215_speech_control_w(u8 data)
 	m_speech_strobe_state = requested_strobe;
 	m_speech_strobe = m_speech_strobe_state;
 	driver_tracef("u215_speech_control_w data=$%02X previous_control=$%02X control_a=$%02X strobe=%u previous_strobe=%u request_flag=%u", data, previous_control, m_u215_control_a, requested_strobe, previous_strobe, m_speech_request_flag);
-	if (!requested_strobe)
-	{
-		m_speech_strobe_clear_timer->adjust(attotime::never);
-		return;
-	}
-	if (!previous_strobe)
-	{
+	// CA2 follows CRA bit 3 (set/reset mode — every CRA value the ROM
+	// writes has bit 4 = 1); the 74LS-side latch fires on the rising edge
+	// only. No auto-clear: the ROM lowers CA2 itself before every phrase
+	// ($F035 CRA=$36) and between phrase phonemes ($D39B restores the
+	// pre-strobe CRA), and the end-of-phrase CRA=$3E deliberately parks
+	// CA2 high so the idle $D31B heartbeat pass produces no further edge.
+	if (requested_strobe && !previous_strobe)
 		latch_speech_phoneme();
-		m_speech_strobe_clear_timer->adjust(attotime::from_usec(100));
-	}
 }
 
 void herojr_state::u215_sonar_echo_w(u8 data)
@@ -878,6 +913,13 @@ void herojr_state::rs232_w(offs_t offset, u8 data)
 
 void herojr_state::speech_request_w(int state)
 {
+	// U223's A/R line drives CA1 directly and operates regardless of the
+	// $D841 D1 rail switch: R226 maintains power to the CMOS SC-01 when
+	// Q204/Q205 are off (JR-TM p27), so the handshake runs even while the
+	// audio path is unpowered — the boot's first phrase depends on it.
+	// The 6821 IRQA1 flag sets on the RISING edge only (CRA bit 1 = 1 in
+	// every CRA value the ROM uses) and persists until a port A data
+	// read clears it.
 	const u8 previous_request = m_speech_request;
 	m_speech_request = state ? 1 : 0;
 	m_speech_ready = m_speech_request;
@@ -885,31 +927,6 @@ void herojr_state::speech_request_w(int state)
 	if (!previous_request && m_speech_request)
 	{
 		m_speech_request_flag = 1;
-		m_speech_request_flag_output = m_speech_request_flag;
-	}
-	if (!m_speech_request)
-		m_speech_request_fallback_timer->adjust(attotime::from_msec(500));
-	else
-		m_speech_request_fallback_timer->adjust(attotime::never);
-}
-
-TIMER_CALLBACK_MEMBER(herojr_state::speech_strobe_clear)
-{
-	m_speech_strobe_state = 0;
-	m_speech_strobe = 0;
-}
-
-TIMER_CALLBACK_MEMBER(herojr_state::speech_request_fallback)
-{
-	// SC-01 phoneme durations are finite.  Save-state/reset edges can leave the
-	// generic Votrax device without a later AR callback; keep the ROM-visible
-	// request line from remaining busy forever in that impossible hardware state.
-	if (!m_speech_request)
-	{
-		m_votrax->reset();
-		m_speech_request = 1;
-		m_speech_request_flag = 0;
-		m_speech_ready = 1;
 		m_speech_request_flag_output = m_speech_request_flag;
 	}
 }
@@ -929,12 +946,23 @@ void herojr_state::set_speech_data(u8 data)
 
 void herojr_state::latch_speech_phoneme()
 {
-	if (!m_speech_power_state)
-		return;
+	// Passive phoneme telemetry (Phase 2.2d): every latched SC-01 byte is
+	// published with a sequence counter and its emulated-time stamp so the
+	// bridge can emit byte-exact phoneme events (io_changed's dedup and
+	// rate limit cannot be byte-exact). A latch while the previous phoneme
+	// is still sounding (request low) is a clip on real hardware; count it.
+	if (!m_speech_request)
+	{
+		m_phoneme_clip_count++;
+		m_phoneme_clips = s32(m_phoneme_clip_count & 0x7fffffff);
+	}
+	m_phoneme_seq_count++;
+	m_phoneme_seq = s32(m_phoneme_seq_count & 0x7fffffff);
+	m_phoneme_byte = m_speech_data;
+	m_phoneme_time_us = emulated_time_us(machine().time());
 
 	m_votrax->inflection_w((m_speech_data >> 6) & 0x03);
 	m_votrax->write(m_speech_data & 0x3f);
-	m_speech_request_fallback_timer->adjust(attotime::from_msec(500));
 }
 
 u8 herojr_state::selected_adc_sample() const

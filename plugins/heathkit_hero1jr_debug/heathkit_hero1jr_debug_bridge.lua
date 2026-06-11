@@ -916,11 +916,14 @@ local function read_u8(addr)
 end
 
 local function herojr_d842_snapshot(port_prefix, speech_prefix)
+  -- 6821 datasheet: the IRQA1 flag (CRA bit 7) is set by an active CA1
+  -- transition regardless of CRA bit 0 (that bit only gates the IRQ line),
+  -- so the snapshot must not gate visibility on the interrupt-enable bit.
+  -- Mirrors the driver's u215_speech_control_r.
   local output = manager.machine.output
   local control = output:get_indexed_value(port_prefix, 2) or 0
   local request = output:get_value("herojr_speech_request_flag") or 0
-  local visible_request = request ~= 0 and (control & 0x01) ~= 0
-  return (control & 0x3f) | (visible_request and 0x80 or 0)
+  return (control & 0x3f) | (request ~= 0 and 0x80 or 0)
 end
 
 local function reset_vector()
@@ -1270,6 +1273,54 @@ local function broadcast_io_changed(force)
     last_io_broadcast_time = now
     broadcast_event("io_changed", state)
   end
+end
+
+-- Dedicated byte-exact phoneme stream (Phase 2.2d, G1J-07/G2J-09/G2J-01):
+-- the driver publishes a latch sequence counter, the latched byte, its
+-- emulated-time stamp, and a cumulative clip counter (latch-while-busy).
+-- io_changed's whole-state dedup and 50 ms rate limit cannot be byte-exact,
+-- so every sequence advance is emitted as its own `phoneme` event. The
+-- shortest SC-01 phoneme (47 ms per the Programmer's Guide chart) outlasts
+-- an emulated frame, so the per-frame poll observes every latch; if latches
+-- ever outpace the poll the gap is reported loudly in `missed`, never
+-- silently absorbed. The counter tracks even with no client attached so a
+-- mid-utterance connect starts clean instead of replaying a backlog burst.
+local last_phoneme_seq = nil
+
+local function broadcast_phoneme_events()
+  if not program_space_available() then
+    return
+  end
+  local output = manager.machine.output
+  local prefix = output_prefix()
+  local seq = output:get_value(prefix .. "_phoneme_seq") or 0
+  if last_phoneme_seq == nil then
+    last_phoneme_seq = seq
+    return
+  end
+  if seq < last_phoneme_seq then
+    -- Counter restarted (machine reset zeroes the telemetry): latches
+    -- 1..seq happened after the restart.
+    last_phoneme_seq = 0
+  end
+  if seq == last_phoneme_seq then
+    return
+  end
+  local missed = seq - last_phoneme_seq - 1
+  last_phoneme_seq = seq
+  if #clients == 0 or seq == 0 then
+    return
+  end
+  local byte = (output:get_value(prefix .. "_phoneme_byte") or 0) & 0xff
+  broadcast_event("phoneme", {
+    seq = seq,
+    byte = byte,
+    phoneme = byte & 0x3f,
+    inflection = (byte >> 6) & 0x03,
+    timeUs = output:get_value(prefix .. "_phoneme_time_us") or 0,
+    clips = output:get_value(prefix .. "_phoneme_clips") or 0,
+    missed = missed
+  })
 end
 
 local function set_registers(params)
@@ -2110,6 +2161,7 @@ local function poll()
     console_log_last = #manager.machine.debugger.consolelog
   end
 
+  broadcast_phoneme_events()
   broadcast_io_changed()
 end
 
