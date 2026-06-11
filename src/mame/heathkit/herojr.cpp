@@ -254,7 +254,6 @@ private:
 	bool m_driver_trace = false;
 	emu_timer *m_rtc_square_wave_timer = nullptr;
 	emu_timer *m_sonar_echo_timer = nullptr;
-	memory_passthrough_handler m_sleep_loop_tap;
 };
 
 void herojr_state::machine_start()
@@ -330,15 +329,6 @@ void herojr_state::machine_start()
 
 	m_rtc_square_wave_timer = timer_alloc(FUNC(herojr_state::rtc_square_wave_tick), this);
 	m_sonar_echo_timer = timer_alloc(FUNC(herojr_state::sonar_echo_tick), this);
-	m_sleep_loop_tap = m_maincpu->space(AS_PROGRAM).install_read_tap(
-		0xec32,
-		0xec32,
-		"herojr_sleep_loop",
-		[this](offs_t offset, u8 &data, u8 mem_mask)
-		{
-			if ((m_maincpu->pc() & 0xffff) == 0xec32)
-				m_maincpu->spin_until_time(attotime::from_msec(10));
-		});
 }
 
 void herojr_state::set_sleep_norm_input(bool norm)
