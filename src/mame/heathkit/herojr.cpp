@@ -145,6 +145,7 @@ private:
 	u8 selected_adc_sample() const;
 	void start_adc_conversion();
 	void clock_adc_bit();
+	void arm_sonar_cycle();
 	void schedule_sonar_echo();
 	void update_u214_input_outputs();
 	void update_irq_line();
@@ -241,6 +242,7 @@ private:
 	u8 m_adc_bits_remaining = 0;
 	u8 m_adc_output_state = 0;
 	u8 m_sonar_echo_state = 0;
+	u8 m_sonar_cycle_armed = 0;
 	u32 m_phoneme_seq_count = 0;
 	u32 m_phoneme_clip_count = 0;
 	u8 m_wheel_feedback_sample = 0;
@@ -334,6 +336,7 @@ void herojr_state::machine_start()
 	save_item(NAME(m_adc_bits_remaining));
 	save_item(NAME(m_adc_output_state));
 	save_item(NAME(m_sonar_echo_state));
+	save_item(NAME(m_sonar_cycle_armed));
 	save_item(NAME(m_phoneme_seq_count));
 	save_item(NAME(m_phoneme_clip_count));
 	save_item(NAME(m_wheel_feedback_sample));
@@ -386,6 +389,7 @@ void herojr_state::reset_interface_state()
 	m_adc_bits_remaining = 0;
 	m_adc_output_state = 0;
 	m_sonar_echo_state = 0;
+	m_sonar_cycle_armed = 0;
 	m_wheel_feedback_sample = 0;
 	m_wheel_feedback_port_a_count = 0;
 	m_light_sample = m_light_level->read() & 0xff;
@@ -759,7 +763,7 @@ void herojr_state::u214_control_b_w(u8 data)
 	const u8 previous_control = m_u214_control_b;
 	m_u214_control_b = data & 0x3f;
 	if (!BIT(previous_control, 3) && BIT(m_u214_control_b, 3))
-		schedule_sonar_echo();
+		arm_sonar_cycle();
 }
 
 void herojr_state::update_u214_input_outputs()
@@ -874,8 +878,18 @@ void herojr_state::u215_speech_power_w(u8 data)
 	m_speech_power = m_speech_power_state;
 	if (BIT(data, 3) != BIT(previous_port, 3))
 		start_adc_conversion();
+	// Shared-line truth (JR-TM printed p. 23 / PDF p. 25): PB5 is both the
+	// A/D clock and the sonar blanking gate ("the same line that is used for
+	// the clock of the A/D converter"). Every falling edge clocks the ADC,
+	// and a falling edge while a sonar cycle is armed is additionally the
+	// receive-window opening (sonar spec §1.3 step 4, §3.3(b)) — the ROM's
+	// $EFD4/$EFD7 blanking release.
 	if (BIT(previous_port, 5) && !BIT(data, 5))
+	{
 		clock_adc_bit();
+		if (m_sonar_cycle_armed)
+			schedule_sonar_echo();
+	}
 	// $D841 D1 switches Q204/Q205 — the AUDIO rail only. R226 maintains
 	// power to U223 itself when they are off and D203 isolates that
 	// maintenance voltage from the amplifier (JR-TM p27), so toggling D1
@@ -1037,18 +1051,64 @@ void herojr_state::clock_adc_bit()
 	m_adc_output = m_adc_output_state;
 }
 
-void herojr_state::schedule_sonar_echo()
+// U214 CB2 (INIT, $D823 bit 3 in the ROM's set/reset mode) rising edge
+// starts a sonar cycle: U307 transmits its 16-pulse burst and the receive
+// chain arms (JR-TM printed p. 23 / PDF p. 25; sonar spec §1.3 steps 2-3).
+// The echo is NOT scheduled here: the CPU blanks the receiver through U215
+// PB5 ($D841 bit 5 — JR-TM printed p. 23: "The CPU controls the blanking
+// with the same line that is used for the clock of the A/D converter";
+// high = receive blanked, spec §1.4), and the calibrated model measures the
+// echo delay from the RECEIVE-WINDOW OPENING (spec §3.3(b)) — the first
+// moment INIT has fired AND PB5 is low. The v1.6 ROM raises PB5 before INIT
+// ($EFB6-$EFB9) and releases it ~627 µs later ($EFD2-$EFD7), so the ROM
+// path anchors at that PB5 release; a raw INIT pulse with PB5 already low
+// (bridge/test stimulus, G1J-06 shape) opens the window at INIT itself.
+// One echo per INIT cycle. The echo-flag clear on this edge is the current
+// model's flag lifecycle (spec §3.2 item 3 verification is a separate
+// dispatch; on real silicon the 6821 IRQB1 flag clears only on a $D841
+// port-B data read and would survive INIT).
+void herojr_state::arm_sonar_cycle()
 {
-	const u8 distance = m_sonar_distance_sample;
 	m_sonar_echo_state = 0;
 	m_sonar_echo = 0;
-	m_sonar_distance_output = distance;
+	m_sonar_distance_output = m_sonar_distance_sample;
 	m_sonar_init_time_us = emulated_time_us(machine().time());
-	driver_tracef("schedule_sonar_echo distance=%u control_b=$%02X port_b=$%02X", distance, m_u214_control_b, m_u214_port_b);
+	m_sonar_cycle_armed = 1;
+	m_sonar_echo_timer->adjust(attotime::never);
+	driver_tracef("arm_sonar_cycle distance=%u pb5=%u control_b=$%02X port_b=$%02X", m_sonar_distance_sample, BIT(m_u215_port_b, 5), m_u214_control_b, m_u214_port_b);
+	if (!BIT(m_u215_port_b, 5))
+		schedule_sonar_echo();
+}
 
-	// The real U307/U308 path measures elapsed echo time.  Keep a deterministic
-	// round-trip scale for firmware polling without claiming calibrated motion.
-	m_sonar_echo_timer->adjust(attotime::from_usec(std::max<u32>(1, distance) * 150));
+// Receive-window opening: schedule the echo at the physical round-trip
+// delay. Calibration constants (sonar spec §2.2/§4, each with its basis):
+//   - Speed of sound used by Heath: 1086 ft/s = 13032 in/s (JR-TM printed
+//     p. 22 / PDF p. 24). Sound travels 2 in of path per inch of target
+//     distance, so the round trip is 2/13032 s/in = 153.47 µs/in —
+//     attotime::from_ticks(2·D, 13032) holds that ratio exactly.
+//   - The v1.6 ROM's poll loop is 12 CPU cycles = 12 µs at E = 1 MHz
+//     (JR-TM printed p. 24 / PDF p. 26; G1J-02), giving 153.47/12 =
+//     12.79 counts/inch, and the ROM adds +$32 (50) to the elapsed count
+//     ($EFDE/$EFEE) ≈ its own 51-iteration (~612 µs) blanking window.
+//   - Composition: count ≈ 12.79·D + 50, and the BASIC cart's count×10÷127
+//     ($744D/$7456) makes SONAR ≈ 1.007·D + 3.9 — the hardware-derived
+//     relation (spec §4). This replaces the old INIT-anchored 150 µs/in
+//     model, which ignored the blanking window the ROM spends before it
+//     starts counting and measured SONAR ≈ 0.983·D − 0.5 (spec §3.2
+//     item 1).
+//   - Blind-zone floor: the transducer cannot see contact-range targets
+//     (JR-TM printed p. 22: "about 4 inches" minimum). Flooring the delay
+//     at one inch keeps an aperture value of 0 from latching before the
+//     ROM's $EFDB pre-read (which would read the count-origin byte as $B4
+//     and saturate the measurement); SONAR's ~4 in floor then falls out of
+//     the ROM's own +50 offset, per the spec §4 "floor ≈ 4" row.
+void herojr_state::schedule_sonar_echo()
+{
+	const u8 distance = std::max<u8>(1, m_sonar_distance_sample);
+	m_sonar_cycle_armed = 0;
+	m_sonar_distance_output = m_sonar_distance_sample;
+	driver_tracef("schedule_sonar_echo distance=%u control_b=$%02X port_b=$%02X", distance, m_u214_control_b, m_u214_port_b);
+	m_sonar_echo_timer->adjust(attotime::from_ticks(2 * u64(distance), 13032));
 }
 
 void herojr_state::update_speech_power()
