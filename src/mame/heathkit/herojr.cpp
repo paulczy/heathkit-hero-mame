@@ -838,9 +838,20 @@ u8 herojr_state::u215_speech_control_r()
 	return (m_u215_control_a & 0x3f) | visible_request;
 }
 
+// $D843 = U215 CRB readback, real 6821 semantics (sonar spec §1.4):
+// bits 5-0 return the written control byte (the write path masks to $3F —
+// bits 7/6 are not writable on a 6821); bit 6 (IRQB2) reads 0 because every
+// CRB value the v1.6 ROM writes ($30 boot, $34 run — $EB7C/$EB86) has
+// bit 5 = 1, CB2 in output (set/reset) mode, which holds the IRQB2 flag
+// clear per the datasheet; bit 7 (IRQB1) is the latched CB1 sonar-echo
+// edge. Idle read = $34, echo-latched read = $B4 (previously hard $00/$80).
+// The ROM's range arithmetic is provably invariant to the low six bits
+// (spec §2.2: the $EFDB pre-read and $EFEB post-subtract bracket them out
+// of the count) — measured before/after identical at five distances,
+// 2026-07-02.
 u8 herojr_state::u215_sonar_echo_r()
 {
-	return m_sonar_echo_state ? 0x80 : 0x00;
+	return (m_u215_control_b & 0x3f) | (m_sonar_echo_state ? 0x80 : 0x00);
 }
 
 void herojr_state::u215_speech_data_w(u8 data)
