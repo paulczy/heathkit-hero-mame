@@ -1623,8 +1623,22 @@ local function bridge_debug_snapshot()
   return snapshot
 end
 
-local function bcd(value)
-  return ((math.floor(value / 10) << 4) | (value % 10)) & 0xff
+-- RTC value encoding (hero-jr-rtc-spec.md §2.2, byte-verified ROM truth):
+-- the v1.6 ROM programs register $0B with DM = 1 (BINARY, not BCD) and
+-- 24/12 = 0 (12-hour mode: hours hold 1-12 with bit 7 as PM). Every
+-- time/calendar byte on the chip — and every ROM RAM copy of one — uses
+-- that encoding (spec §2.6; G2J-07's committed readbacks corroborate it).
+local function rtc_hours_12h_binary(hour24)
+  local hour = (tonumber(hour24) or 0) % 24
+  local pm = 0x00
+  if hour >= 12 then
+    pm = 0x80
+    hour = hour - 12
+  end
+  if hour == 0 then
+    hour = 12
+  end
+  return (pm | hour) & 0xff
 end
 
 local function write_rtc_register(register, value)
@@ -1683,18 +1697,43 @@ local function initialize_herojr_retained_ram_context(t)
     write_u8(0x00c4 + (i * 5), 0x00)
   end
 
+  -- Raw RTC register bytes in the chip's own encoding — binary, 12-hour
+  -- (hero-jr-rtc-spec.md §2.2/§2.6). Order matches the ROM's 7-byte time
+  -- buffers: sec, min, hr, dow, date, month, year (spec §2.1).
   local rtc_snapshot = {
-    bcd(t.second or 0),
-    bcd(t.minute or 0),
-    bcd(t.hour or 0),
-    bcd(t.wday or 1),
-    bcd(t.day or 1),
-    bcd(t.month or 1),
-    bcd((t.year or 1984) % 100)
+    (t.second or 0) % 60,
+    (t.minute or 0) % 60,
+    rtc_hours_12h_binary(t.hour or 0),
+    (t.wday or 1) & 0xff,
+    (t.day or 1) & 0xff,
+    (t.month or 1) & 0xff,
+    (t.year or 1984) % 100
   }
 
+  -- ROM RTC shadow $067F-$068A (hero-jr-rtc-spec.md §2.1, the $EEC6/$EF0F
+  -- layout, index = register number): clock and alarm registers interleave
+  -- through day-of-week, then date/month/year follow at STRIDE 1. The old
+  -- stride-2-throughout seeding landed date/month/year at $0687/$0689/$068B
+  -- instead of $0686/$0687/$0688 (spec §3.5 defect, corrected 2026-07-03).
+  -- Alarm slots mirror the chip's alarm registers (no armed wake, $00 —
+  -- see initialize_herojr_warm_context).
+  local rtc_shadow = {
+    { 0x067f, rtc_snapshot[1] }, -- sec        (reg $00)
+    { 0x0680, 0x00 },            -- sec-alarm  (reg $01)
+    { 0x0681, rtc_snapshot[2] }, -- min        (reg $02)
+    { 0x0682, 0x00 },            -- min-alarm  (reg $03)
+    { 0x0683, rtc_snapshot[3] }, -- hr         (reg $04)
+    { 0x0684, 0x00 },            -- hr-alarm   (reg $05)
+    { 0x0685, rtc_snapshot[4] }, -- dow        (reg $06)
+    { 0x0686, rtc_snapshot[5] }, -- date       (reg $07)
+    { 0x0687, rtc_snapshot[6] }, -- month      (reg $08)
+    { 0x0688, rtc_snapshot[7] }  -- year       (reg $09)
+  }
+  for _, entry in ipairs(rtc_shadow) do
+    write_u8(entry[1], entry[2])
+  end
+
   for i, value in ipairs(rtc_snapshot) do
-    write_u8(0x067f + ((i - 1) * 2), value)
     write_u8(0x0092 + i, value)
   end
 
@@ -1729,27 +1768,48 @@ local function initialize_herojr_warm_context(params)
     dst = t.isdst == true
   end
 
-  -- ROM $EE07 commits seconds, minutes, hours, day-of-week, day-of-month,
-  -- month, and year into RTC registers $00-$06.
-  write_rtc_register(0x00, bcd(t.second or 0))
-  write_rtc_register(0x01, bcd(t.minute or 0))
-  write_rtc_register(0x02, bcd(t.hour or 0))
-  write_rtc_register(0x03, bcd(t.wday or 1))
-  write_rtc_register(0x04, bcd(t.day or 1))
-  write_rtc_register(0x05, bcd(t.month or 1))
-  write_rtc_register(0x06, bcd((t.year or 1984) % 100))
+  -- Real MC146818 register map (hero-jr-rtc-spec.md §2.1 — the ROM's own
+  -- $EE07/$EF0F set-time path writes the full interleaved file $00-$09:
+  -- $00 sec, $01 sec-alarm, $02 min, $03 min-alarm, $04 hr, $05 hr-alarm,
+  -- $06 dow, $07 date, $08 month, $09 year). Values are BINARY with
+  -- 12-hour PM-bit hours per the ROM's DM = 1 / 24-12 = 0 programming
+  -- (spec §2.2). The old fixture wrote a compacted BCD $00-$06 map that
+  -- skewed the alarm registers and never wrote date/month/year — the spec
+  -- §3.5 defect, corrected 2026-07-03.
+  --
+  -- Alarm registers hold $00 = no armed wake: the warm contract boots with
+  -- AF clear and AIE off, the awake ROM never consumes the alarm (spec
+  -- §2.8), and in 12-hour mode the hour register never reads $00 (1-12
+  -- with PM bit), so a $00 hr-alarm can never spuriously match and set AF.
+  write_rtc_register(0x00, (t.second or 0) % 60)
+  write_rtc_register(0x01, 0x00)
+  write_rtc_register(0x02, (t.minute or 0) % 60)
+  write_rtc_register(0x03, 0x00)
+  write_rtc_register(0x04, rtc_hours_12h_binary(t.hour or 0))
+  write_rtc_register(0x05, 0x00)
+  write_rtc_register(0x06, (t.wday or 1) & 0xff)
+  write_rtc_register(0x07, (t.day or 1) & 0xff)
+  write_rtc_register(0x08, (t.month or 1) & 0xff)
+  write_rtc_register(0x09, (t.year or 1984) % 100)
 
-  local reg_b = read_rtc_register(0x0b)
-  if dst then
-    reg_b = reg_b | 0x01
-  else
-    reg_b = reg_b & 0xfe
-  end
-  write_rtc_register(0x0b, reg_b)
+  -- Register $0B: the Vca-retained control byte exactly as RESET leaves it
+  -- on a real warm boot — RESET clears SQWE and the interrupt enables but
+  -- keeps DM/24-12 (spec §1.4): DM = 1 binary, 12-hour, SET/PIE/AIE/UIE/
+  -- SQWE = 0, DSE per request. Writing the mode bits keeps the chip's
+  -- update arithmetic consistent with the binary payload above; the ROM's
+  -- boot re-init preserves only DSE anyway ($FFA6, spec §2.2).
+  write_rtc_register(0x0b, 0x04 | (dst and 0x01 or 0x00))
 
-  local reg_c = read_rtc_register(0x0c) & 0xdf
-  write_rtc_register(0x0c, reg_c)
-  write_rtc_register(0x0d, read_rtc_register(0x0d) | 0x80)
+  -- Register $0C is read-only (spec §3.4/§3.5 — device writes to REG_C are
+  -- ignored); the READ is what clears stale AF/PF, the same stale-flag
+  -- consumption the ROM's own alarm-set path performs (spec §2.1 $EE7D).
+  -- The warm contract requires AF clear (G2J-04 M1), so read and discard.
+  read_rtc_register(0x0c)
+
+  -- Register $0D is read-only too; READING it sets VRT — the ROM's own
+  -- cookie-arm protocol does exactly this read before writing $0E
+  -- (spec §2.5, $ED9B write-mode). The old $0D write-back was a no-op.
+  read_rtc_register(0x0d)
   write_rtc_register(0x0e, 0xff)
   initialize_herojr_retained_ram_context(t)
 
