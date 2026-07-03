@@ -153,7 +153,8 @@ private:
 	void set_sleep_norm_input(bool norm);
 	void reset_interface_state();
 	void set_reset_line(bool asserted);
-	TIMER_CALLBACK_MEMBER(rtc_square_wave_tick);
+	void rtc_sqw_w(int state);
+	TIMER_CALLBACK_MEMBER(wheel_feedback_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 
 	template <typename... FormatParams>
@@ -234,8 +235,14 @@ private:
 	u8 m_u214_control_a = 0;
 	u8 m_u214_control_b = 0;
 	u8 m_motion_detector_state = 0;
-	u8 m_rtc_sqw_state = 0;
-	u8 m_rtc_irq_state = 0;
+	// U213 SQW pin level, driven by the mc146818 device's own sqw()
+	// callback (256 Hz once the ROM programs reg $0A = $28 and SQWE at
+	// $ED86 — hero-jr-rtc-spec.md §2.2; no driver rate constant exists).
+	u8 m_rtc_sqw_level = 0;
+	// U214 IRQA1: the 6821-latched CA1 flag ($D822 bit 7). Set on the CA1
+	// active transition (SQW through the U211D inverter, spec §1.4),
+	// cleared ONLY by a $D820 Peripheral Register A read (spec §2.3).
+	u8 m_u214_ca1_flag = 0;
 	u8 m_acia_irq_state = 0;
 	u8 m_speech_data = 0;
 	u8 m_u215_ddr_a = 0;
@@ -264,7 +271,7 @@ private:
 	s16 m_steering_position = 0;
 	u8 m_steering_phase = 0;
 	bool m_driver_trace = false;
-	emu_timer *m_rtc_square_wave_timer = nullptr;
+	emu_timer *m_wheel_feedback_timer = nullptr;
 	emu_timer *m_sonar_echo_timer = nullptr;
 };
 
@@ -328,8 +335,8 @@ void herojr_state::machine_start()
 	save_item(NAME(m_u214_control_a));
 	save_item(NAME(m_u214_control_b));
 	save_item(NAME(m_motion_detector_state));
-	save_item(NAME(m_rtc_sqw_state));
-	save_item(NAME(m_rtc_irq_state));
+	save_item(NAME(m_rtc_sqw_level));
+	save_item(NAME(m_u214_ca1_flag));
 	save_item(NAME(m_acia_irq_state));
 	save_item(NAME(m_speech_data));
 	save_item(NAME(m_u215_ddr_a));
@@ -358,7 +365,7 @@ void herojr_state::machine_start()
 	save_item(NAME(m_steering_position));
 	save_item(NAME(m_steering_phase));
 
-	m_rtc_square_wave_timer = timer_alloc(FUNC(herojr_state::rtc_square_wave_tick), this);
+	m_wheel_feedback_timer = timer_alloc(FUNC(herojr_state::wheel_feedback_tick), this);
 	m_sonar_echo_timer = timer_alloc(FUNC(herojr_state::sonar_echo_tick), this);
 }
 
@@ -382,6 +389,7 @@ void herojr_state::reset_interface_state()
 	m_u214_port_b = 0x00;
 	m_u214_control_a = 0;
 	m_u214_control_b = 0;
+	m_u214_ca1_flag = 0; // 6821 reset clears the interrupt flags
 	m_motion_detector_state = 0;
 	m_speech_data = 0;
 	m_u215_ddr_a = 0;
@@ -444,6 +452,17 @@ void herojr_state::set_reset_line(bool asserted)
 	{
 		m_maincpu->resume(SUSPEND_REASON_HALT);
 		reset_interface_state();
+		// U213 RESET* (pin 18) sits on the same system reset net that
+		// "resets the CPU and interface ICs" (JR-TM printed p. 28 / PDF
+		// p. 30; hero-jr-rtc-spec.md §1.4), so the panel RESET press — and
+		// the bridge's reset_machine, which presses this same modeled
+		// input — must reach the chip. MAME's device_reset() implements
+		// the datasheet RESET* rule: PIE/AIE/UIE/SQWE clear, time/calendar
+		// /NVRAM survive. Operator-visible consequence: pressing RESET
+		// cancels a pending wake alarm (JR-OG printed pp. 23, 38 via
+		// JR-PWR; spec §3.2 honesty gap closed 2026-07-03).
+		m_rtc->reset();
+		update_irq_line();
 	}
 	m_maincpu->set_input_line(INPUT_LINE_RESET, asserted ? ASSERT_LINE : CLEAR_LINE);
 }
@@ -451,23 +470,28 @@ void herojr_state::set_reset_line(bool asserted)
 void herojr_state::machine_reset()
 {
 	reset_interface_state();
-	m_rtc_sqw_state = 0;
-	m_rtc_irq_state = 0;
 	m_acia_irq_state = 0;
 	m_rs232_status = 0;
 	m_rs232_data = 0;
-	m_rtc_sqw = 0;
+	m_rtc_sqw = m_rtc_sqw_level;
 	m_rs232_status_output = 0;
 	m_rs232_data_output = 0;
-	// The monitor polls MC146818 register A through $D810/$D811 during boot
-	// and waits for UIP to clear.  Start from valid divider/rate registers
-	// instead of inheriting erased NVRAM bytes.  Do not prime status D here:
-	// an erased/invalid RTC is how the ROM reaches the full self-diagnostic.
-	m_rtc->write_direct(0x0a, 0x26);
-	m_rtc->write_direct(0x0b, 0x02);
+	// No RTC register scaffolding here: on real hardware registers $0A/$0B
+	// are Vca-retained and RESET* only clears PIE/AIE/UIE/SQWE (the
+	// mc146818 device_reset already models that). The ROM re-programs both
+	// registers unconditionally on every reset-vector pass ($EB51 → $ED86:
+	// $0A = $28, $0B = $0C|DSE — hero-jr-rtc-spec.md §2.2/§3.2; the old
+	// $26/$02 seed contradicted those ROM values and was dead within
+	// milliseconds).
 	update_irq_line();
-	m_rtc_square_wave_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
-	driver_tracef("machine_reset sleep_norm=%u speech_request=%u rtc_sqw=%u", m_sleep_norm->read(), m_speech_request, m_rtc_sqw_state);
+	// Wheel-feedback/world-model pacing timer. 1024 Hz is this driver's
+	// pre-existing mechanical-model constant (2048-tick coast tail ≈ 2 s,
+	// G1J-04/G1J-05 measured basis) — it is NOT the RTC tick: the real
+	// SQW interrupt path runs at 256 Hz through the mc146818 sqw()
+	// callback (rtc_sqw_w), and tying the drive model to it would silently
+	// re-time drive pacing 4x (spec §3.1 co-move note).
+	m_wheel_feedback_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
+	driver_tracef("machine_reset sleep_norm=%u speech_request=%u rtc_sqw=%u", m_sleep_norm->read(), m_speech_request, m_rtc_sqw_level);
 }
 
 INPUT_CHANGED_MEMBER(herojr_state::sleep_norm_changed)
@@ -594,6 +618,19 @@ void herojr_state::rtc_w(offs_t offset, u8 data)
 u8 herojr_state::u214_port_a_r()
 {
 	const u8 data = keypad_matrix_r();
+	// 6821 datasheet: a Peripheral Register A read clears the latched
+	// IRQA1 flag (and releases IRQA*). This is the ONLY clear on real
+	// silicon, and the v1.6 ROM leans on it: the $D17F tick service's
+	// keyboard scan ($D1C5) reads $D820, consuming exactly one RTC SQW
+	// tick per service pass — the 256/s cadence of hero-jr-rtc-spec.md
+	// §2.3. (U214 has no DDR routing model — tech-debt item 7 — so every
+	// read here is a peripheral-register read.) Debugger/UI reads are
+	// guarded, matching the U215 request-flag and sonar-echo clears.
+	if (!machine().side_effects_disabled() && m_u214_ca1_flag)
+	{
+		m_u214_ca1_flag = 0;
+		update_irq_line();
+	}
 	driver_tracef("u214_port_a_r data=$%02X port_a=$%02X wheel_feedback=%u feedback_count=%u", data, m_u214_port_a, m_wheel_feedback_sample, m_wheel_feedback_port_a_count);
 	return data;
 }
@@ -742,9 +779,20 @@ void herojr_state::u214_port_b_w(u8 data)
 	update_u214_input_outputs();
 }
 
+// $D822 = U214 CRA readback, real 6821 semantics (mirrors U215's $D842):
+// bits 5-0 return the written control byte; bit 6 (IRQA2) reads 0 because
+// every CRA value the v1.6 ROM writes has bit 5 = 1 (CA2 in output mode,
+// which holds IRQA2 clear per the datasheet); bit 7 is the LATCHED IRQA1
+// flag — the RTC SQW tick through U211D (spec §1.4) — visible regardless
+// of CRA bit 0 (that bit only gates the IRQA* line), so the firmware's
+// polled reads see pending ticks even with interrupts disabled. A CRA
+// read never clears the flag; only the $D820 port A data read does.
+// (Previously this returned the raw SQW toggle LEVEL, which — with the
+// level-held IRQ — produced the measured 1927.7/s burst service instead
+// of the hardware's one-per-period 256/s; spec §3.1.)
 u8 herojr_state::u214_control_a_r()
 {
-	return (m_u214_control_a & 0x3f) | (m_rtc_sqw_state ? 0x80 : 0x00);
+	return (m_u214_control_a & 0x3f) | (m_u214_ca1_flag ? 0x80 : 0x00);
 }
 
 u8 herojr_state::u214_control_b_r()
@@ -760,6 +808,10 @@ u8 herojr_state::u214_control_b_r()
 void herojr_state::u214_control_a_w(u8 data)
 {
 	m_u214_control_a = data & 0x3f;
+	// CRA bit 0 gates IRQA* onto the CPU IRQ net (both U214 interrupt
+	// outputs sit on it, JR-SCH sheet 3 / spec §1.4), so a CRA rewrite can
+	// mask or expose a pending latched flag.
+	update_irq_line();
 }
 
 void herojr_state::u214_control_b_w(u8 data)
@@ -779,18 +831,56 @@ void herojr_state::update_u214_input_outputs()
 		m_wheel_feedback_sample = 0;
 		m_wheel_feedback = 0;
 	}
-	m_rtc_sqw = m_rtc_sqw_state;
 }
 
+// CPU IRQ* net: U214 IRQA*/IRQB* and the ACIA interrupt share it (JR-SCH
+// sheet 3; spec §1.4). U214's contribution is the 6821 rule — latched flag
+// AND its CRA enable bit. The RTC's own IRQ* pin (U213-19) is NOT on this
+// net: it feeds the sleep-mode wake circuit (U222A) only, which is G2J-08
+// scope. (U215's IRQA wiring to the CPU awaits JR-TM adjudication,
+// tech-debt §2 — unchanged here.)
 void herojr_state::update_irq_line()
 {
-	m_maincpu->set_input_line(INPUT_LINE_IRQ0, (m_rtc_irq_state || m_acia_irq_state) ? ASSERT_LINE : CLEAR_LINE);
+	const bool u214_irq_a = m_u214_ca1_flag && BIT(m_u214_control_a, 0);
+	m_maincpu->set_input_line(INPUT_LINE_IRQ0, (u214_irq_a || m_acia_irq_state) ? ASSERT_LINE : CLEAR_LINE);
 }
 
-TIMER_CALLBACK_MEMBER(herojr_state::rtc_square_wave_tick)
+// U213 SQW (pin 23) → U211D inverter → U214 CA1 (pin 40): "The output of
+// one of the internal dividers (SQW) of U213-23 is routed through U211D to
+// interrupt input on U214-40" (JR-TM printed p. 28 / PDF p. 30, verbatim).
+// The rate is chip-derived — the ROM's own $ED86 boot init programs
+// reg $0A = $28 (DV=010, RS=1000 → 256 Hz) and sets SQWE (spec §2.2), so
+// this callback carries no driver frequency constant, and SQWE honestly
+// gates it (RESET* clears SQWE, silencing ticks until the ROM re-inits).
+// The 6821 IRQA1 flag latches on the CA1 transition selected by CRA
+// bit 1 (every CRA value the v1.6 ROM writes has bit 1 = 1: active RISING
+// CA1 = falling SQW through the inverter) — one latched tick per SQW
+// period, cleared only by the $D820 port A data read (u214_port_a_r).
+// This replaces the deleted hand 1024 Hz toggle timer whose level-held
+// IRQ measured 1927.7 serviced ticks/s (spec §3.1, probe 2026-07-03).
+void herojr_state::rtc_sqw_w(int state)
 {
-	m_rtc_sqw_state ^= 1;
-	m_rtc_irq_state = m_rtc_sqw_state;
+	const u8 level = state ? 1 : 0;
+	if (level == m_rtc_sqw_level)
+		return;
+	m_rtc_sqw_level = level;
+	m_rtc_sqw = m_rtc_sqw_level;
+	const u8 ca1_level = m_rtc_sqw_level ? 0 : 1; // U211D inversion
+	const bool ca1_active_rising = BIT(m_u214_control_a, 1);
+	if ((ca1_active_rising && ca1_level) || (!ca1_active_rising && !ca1_level))
+	{
+		m_u214_ca1_flag = 1;
+		update_irq_line();
+	}
+}
+
+// Mechanical world-model pacing (wheel feedback + drive-coupled sonar
+// distance). 1024 Hz and the 2048-tick coast tail are this driver's
+// pre-existing model constants (G1J-04/G1J-05 measured basis); the timer
+// deliberately does NOT touch the CPU IRQ line or the RTC tick path —
+// those belong to rtc_sqw_w above (spec §3.1 co-move).
+TIMER_CALLBACK_MEMBER(herojr_state::wheel_feedback_tick)
+{
 	if (drive_feedback_active() || m_wheel_feedback_port_a_count != 0)
 	{
 		advance_wheel_feedback_sample();
@@ -799,8 +889,6 @@ TIMER_CALLBACK_MEMBER(herojr_state::rtc_square_wave_tick)
 	}
 	update_drive_sonar_motion();
 	update_u214_input_outputs();
-	update_irq_line();
-
 }
 
 u8 herojr_state::u215_speech_data_r()
@@ -1239,6 +1327,11 @@ void herojr_state::herojr(machine_config &config)
 	RAM(config, m_ram).set_default_size("2K").set_extra_options("16K");
 
 	MC146818(config, m_rtc, 32.768_kHz_XTAL);
+	// SQW pin → U211D → U214 CA1 (rtc_sqw_w). The device's IRQ* pin
+	// (U213-19) is deliberately left unbound: on this board it feeds the
+	// U222A sleep-mode wake circuit, never the CPU IRQ net (JR-TM printed
+	// p. 28 / PDF p. 30; spec §1.4) — wake modeling is G2J-08 scope.
+	m_rtc->sqw().set(FUNC(herojr_state::rtc_sqw_w));
 
 	ACIA6850(config, m_acia, 0);
 	m_acia->irq_handler().set(FUNC(herojr_state::acia_irq_w));
