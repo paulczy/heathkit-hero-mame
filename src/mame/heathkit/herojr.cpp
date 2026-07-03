@@ -89,6 +89,7 @@ public:
 		m_wheel_feedback(*this, "herojr_wheel_feedback"),
 		m_drive_activity(*this, "herojr_drive_activity"),
 		m_rtc_sqw(*this, "herojr_rtc_sqw"),
+		m_u214_control_b_output(*this, "herojr_u214_control_b"),
 		m_rs232_status_output(*this, "herojr_rs232_status"),
 		m_rs232_data_output(*this, "herojr_rs232_data"),
 		m_ram_top(*this, "herojr_ram_top"),
@@ -217,6 +218,11 @@ private:
 	output_finder<> m_wheel_feedback;
 	output_finder<> m_drive_activity;
 	output_finder<> m_rtc_sqw;
+	// U214 CRB write latch (low six bits) for the bridge io snapshot: the
+	// $D823 read handler advances the wheel-feedback sample as a model side
+	// effect, so the observer composes from this output instead of reading
+	// the bus (plugin herojr_d823_snapshot).
+	output_finder<> m_u214_control_b_output;
 	output_finder<> m_rs232_status_output;
 	output_finder<> m_rs232_data_output;
 	// Top of populated RAM ($07FF stock / $3FFF expanded) for bridge truth.
@@ -307,6 +313,7 @@ void herojr_state::machine_start()
 	m_wheel_feedback.resolve();
 	m_drive_activity.resolve();
 	m_rtc_sqw.resolve();
+	m_u214_control_b_output.resolve();
 	m_rs232_status_output.resolve();
 	m_rs232_data_output.resolve();
 	m_port_outputs.resolve();
@@ -425,6 +432,7 @@ void herojr_state::reset_interface_state()
 	m_motion_detector = 0;
 	m_wheel_feedback = 0;
 	m_drive_activity = 0;
+	m_u214_control_b_output = 0;
 	for (int port = 0; port < 8; port++)
 		m_port_outputs[port] = 0;
 	m_sonar_echo_timer->adjust(attotime::never);
@@ -758,6 +766,7 @@ void herojr_state::u214_control_b_w(u8 data)
 {
 	const u8 previous_control = m_u214_control_b;
 	m_u214_control_b = data & 0x3f;
+	m_u214_control_b_output = m_u214_control_b;
 	if (!BIT(previous_control, 3) && BIT(m_u214_control_b, 3))
 		arm_sonar_cycle();
 }
@@ -811,6 +820,22 @@ u8 herojr_state::u215_speech_power_r()
 {
 	if (!BIT(m_u215_control_b, 2))
 		return m_u215_ddr_b;
+
+	// 6821 datasheet: a Peripheral Register B read (CRB bit 2 = 1, this
+	// branch) clears the latched IRQB1 flag — the $D843 bit-7 sonar echo,
+	// set by the CB1 edge. That read is the ONLY clear on real silicon
+	// (never CRB reads, never INIT edges), and the v1.6 ROM leans on it
+	// twice per measurement: the $EFB6 stale-flag discard before INIT and
+	// the $EFD4 blanking-window discard (hero-jr-sonar-spec.md §3.2 item 3,
+	// adjudicated 2026-07-02, implemented 2026-07-03 together with the
+	// plugin io-snapshot compose that stops observer bus reads). A DDRB
+	// read (branch above) does not clear. Debugger/UI reads are guarded.
+	if (!machine().side_effects_disabled() && m_sonar_echo_state)
+	{
+		m_sonar_echo_state = 0;
+		m_sonar_echo = 0;
+		driver_tracef("u215_speech_power_r cleared sonar echo flag (6821 IRQB1 clear-on-read)");
+	}
 
 	// PB0 is a CPU-driven port-B bit; the firmware uses it as a software
 	// speech-busy flag (set before a phoneme, cleared by the CA1 ISR) and reads
@@ -1089,10 +1114,11 @@ void herojr_state::clock_adc_bit()
 // INIT anchor 2026-07-02. A raw INIT pulse with PB5 already low
 // (bridge/test stimulus, G1J-06 shape) anchored at INIT before and still
 // does — its 153.3-153.5 µs/in telemetry is unchanged. One echo per INIT
-// cycle (the one-shot timer re-arms only here). The echo-flag clear on
-// this edge is the current model's flag lifecycle (spec §3.2 item 3
-// verification is a separate dispatch; on real silicon the 6821 IRQB1
-// flag clears only on a $D841 port-B data read and would survive INIT).
+// cycle (the one-shot timer re-arms only here). The latched echo flag
+// SURVIVES this edge: per the 6821 datasheet IRQB1 clears only on a $D841
+// Peripheral Register B read (u215_speech_power_r; sonar spec §3.2
+// item 3, implemented 2026-07-03) — a stale flag is discarded by the
+// reader's own $D841 read, exactly the ROM's $EFB6 pre-INIT protocol.
 // There is no 1-inch scheduling floor any more: its purpose — keeping an
 // aperture value of 0 from latching before the ROM's $EFDB pre-read — is
 // superseded by the blanking mask (in the ROM path PB5 is still high that
@@ -1100,8 +1126,6 @@ void herojr_state::clock_adc_bit()
 // is the physical answer for a contact-range target).
 void herojr_state::arm_sonar_cycle()
 {
-	m_sonar_echo_state = 0;
-	m_sonar_echo = 0;
 	m_sonar_distance_output = m_sonar_distance_sample;
 	m_sonar_init_time_us = emulated_time_us(machine().time());
 	driver_tracef("arm_sonar_cycle distance=%u pb5=%u control_b=$%02X port_b=$%02X", m_sonar_distance_sample, BIT(m_u215_port_b, 5), m_u214_control_b, m_u214_port_b);
