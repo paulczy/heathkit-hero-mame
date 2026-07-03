@@ -941,6 +941,44 @@ local function herojr_d842_snapshot(port_prefix, speech_prefix)
   return (control & 0x3f) | (request ~= 0 and 0x80 or 0)
 end
 
+local function herojr_d841_snapshot(port_prefix)
+  -- $D841 (U215 port B) composed from driver outputs, never a bus read:
+  -- on a 6821 a Peripheral Register B READ is the ONLY thing that clears
+  -- the latched IRQB1 sonar-echo flag ($D843 bit 7) — the ROM leans on
+  -- exactly that twice per measurement ($EFB6 stale discard, $EFD4
+  -- blanking discard) — so an every-frame observer bus read would consume
+  -- echoes the firmware is entitled to see (hero-jr-sonar-spec.md §3.2
+  -- item 3, implemented 2026-07-03). Mirrors the driver's
+  -- u215_speech_power_r peripheral-register composition:
+  --   bits 0-3, 5, 7 = the CPU-driven port B output latch (port_out_1),
+  --   bit 4 = serial ADC output bit (herojr_adc_output),
+  --   bit 6 = Sleep/Norm switch (ioport read — side-effect-free, the same
+  --           m_sleep_norm->read() the driver performs).
+  local output = manager.machine.output
+  local port_b = output:get_indexed_value(port_prefix, 1) or 0
+  local adc_output = output:get_value("herojr_adc_output") or 0
+  local sleep_norm = 1
+  local port = manager.machine.ioport.ports[":SLEEP_NORM"] or manager.machine.ioport.ports["SLEEP_NORM"]
+  if port then
+    sleep_norm = port:read() & 0x01
+  end
+  return (port_b & 0xaf) | (adc_output ~= 0 and 0x10 or 0x00) | (sleep_norm ~= 0 and 0x40 or 0x00)
+end
+
+local function herojr_d823_snapshot()
+  -- $D823 (U214 CRB) composed from driver outputs, never a bus read: the
+  -- driver's u214_control_b_r ADVANCES the wheel-feedback sample on every
+  -- read while drive feedback is active (the firmware's poll pacing), so
+  -- an observer bus read perturbs the drive model. Low six bits = the
+  -- written CRB latch (herojr_u214_control_b), bit 7 = bit 0 of the
+  -- current wheel-feedback sample — the same composition the driver's
+  -- read handler returns, minus the CPU-owned advance.
+  local output = manager.machine.output
+  local control_b = output:get_value("herojr_u214_control_b") or 0
+  local feedback = output:get_value("herojr_wheel_feedback") or 0
+  return (control_b & 0x3f) | ((feedback & 0x01) ~= 0 and 0x80 or 0x00)
+end
+
 local function reset_vector()
   return ((read_u8(0xfffe) << 8) | read_u8(0xffff)) & 0xffff
 end
@@ -1050,10 +1088,31 @@ local function get_io_state()
   local arm_select_speech_clock = indexed_output_value(port_prefix, 6)
   local system_select = indexed_output_value(port_prefix, 7)
   local herojr_control = indexed_output_value(port_prefix, 1)
+  -- Side-effect adjudication for the herojr io snapshot, which runs every
+  -- frame while a client is connected (hero-jr-rtc-spec.md §3.3). Each
+  -- address is bus-read ONLY if the driver's read handler is provably free
+  -- of model side effects; otherwise it is composed from driver outputs:
+  --   $D821 u214_port_b_r    — pure composition (port latch + motion
+  --         level). Real 6821 silicon clears U214's latched IRQB1/IRQB2 on
+  --         this read, but the current driver keeps no latched U214 flags
+  --         (wheel feedback is level-derived; the CA1 latch model is the
+  --         RTC-spec §3.1 driver session) — bus read honest TODAY;
+  --         recompose when U214 grows latched flags.
+  --   $D822 u214_control_a_r — pure (CRA | SQW level); 6821 control-
+  --         register reads never clear flags — safe bus read even after
+  --         the §3.1 CA1-latch model lands.
+  --   $D823 u214_control_b_r — SIDE-EFFECTFUL (advances the wheel-feedback
+  --         sample while drive is active): composed, herojr_d823_snapshot.
+  --   $D841 u215_speech_power_r — SIDE-EFFECTFUL (clears the latched
+  --         sonar-echo flag per 6821 IRQB1 clear-on-read, sonar spec §3.2
+  --         item 3): composed, herojr_d841_snapshot.
+  --   $D843 u215_sonar_echo_r — pure (CRB latch | echo flag); a CRB read
+  --         does NOT clear IRQB1 (6821 datasheet, sonar spec §3.2 item 3
+  --         adjudication) — safe bus read.
   local herojr_d821 = prefix == "herojr" and read_u8(0xd821) or 0
   local herojr_d822 = prefix == "herojr" and read_u8(0xd822) or 0
-  local herojr_d823 = prefix == "herojr" and read_u8(0xd823) or 0
-  local herojr_d841 = prefix == "herojr" and read_u8(0xd841) or 0
+  local herojr_d823 = prefix == "herojr" and herojr_d823_snapshot() or 0
+  local herojr_d841 = prefix == "herojr" and herojr_d841_snapshot(port_prefix) or 0
   local herojr_d842 = prefix == "herojr" and herojr_d842_snapshot(port_prefix, speech_prefix) or 0
   local herojr_d843 = prefix == "herojr" and read_u8(0xd843) or 0
   local herojr_motion_detector = output_value(prefix .. "_motion_detector")
