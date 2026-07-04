@@ -1125,6 +1125,14 @@ local function get_io_state()
   local herojr_sonar_distance = output_value(prefix .. "_sonar_distance")
   local herojr_sonar_init_time_us = output_value(prefix .. "_sonar_init_time_us")
   local herojr_sonar_echo_time_us = output_value(prefix .. "_sonar_echo_time_us")
+  -- G2J-08 power model outputs: green LED = modeled Vcc (the U222 sleep
+  -- latch drives +5 SHUTDOWN; LED off = latched asleep). The µs stamps and
+  -- wake-cycle counter resolve catnap pulses shorter than the snapshot
+  -- cadence — same pattern as the sonar INIT/echo stamps.
+  local herojr_power_led = output_value(prefix .. "_power_led")
+  local herojr_power_on_time_us = output_value(prefix .. "_power_on_time_us")
+  local herojr_power_off_time_us = output_value(prefix .. "_power_off_time_us")
+  local herojr_power_cycles = output_value(prefix .. "_power_cycles")
   local experimental_output = prefix == "hero1" and indexed_output_value(port_prefix, 1) or 0
   local experimental_input = prefix == "hero1" and read_u8(0xc2a0) or 0
   local experimental_interrupt_status = prefix == "hero1" and read_u8(0xc200) or 0
@@ -1268,6 +1276,18 @@ local function get_io_state()
         endAddress = 0xd81f,
         sqw = herojr_rtc_sqw,
         sqwStatus = (herojr_d822 >> 7) & 0x01
+      },
+      -- G2J-08 sleep/wake power model (hero-jr-rtc-spec.md §2.7/§2.8;
+      -- AUDIT-2026-06.md U222 wire-walk). greenLed is the modeled Vcc: the
+      -- green POWER LED is a power indicator, not a port (JR-OG p. 38 —
+      -- "The green LED will flash once every five seconds while it is
+      -- sleeping" — that flash is firmware catnap physics, never scripted).
+      power = {
+        greenLed = herojr_power_led,
+        vcc = herojr_power_led,
+        onTimeUs = herojr_power_on_time_us,
+        offTimeUs = herojr_power_off_time_us,
+        wakeCycles = herojr_power_cycles
       },
       rs232 = {
         status = herojr_rs232_status,

@@ -89,6 +89,10 @@ public:
 		m_wheel_feedback(*this, "herojr_wheel_feedback"),
 		m_drive_activity(*this, "herojr_drive_activity"),
 		m_rtc_sqw(*this, "herojr_rtc_sqw"),
+		m_power_led(*this, "herojr_power_led"),
+		m_power_on_time_us(*this, "herojr_power_on_time_us"),
+		m_power_off_time_us(*this, "herojr_power_off_time_us"),
+		m_power_cycles(*this, "herojr_power_cycles"),
 		m_u214_control_b_output(*this, "herojr_u214_control_b"),
 		m_rs232_status_output(*this, "herojr_rs232_status"),
 		m_rs232_data_output(*this, "herojr_rs232_data"),
@@ -154,6 +158,10 @@ private:
 	void reset_interface_state();
 	void set_reset_line(bool asserted);
 	void rtc_sqw_w(int state);
+	void rtc_irq_w(int state);
+	void update_u214_ca2(u8 control);
+	void sleep_power_down();
+	void sleep_wake(const char *cause);
 	TIMER_CALLBACK_MEMBER(wheel_feedback_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 
@@ -219,6 +227,19 @@ private:
 	output_finder<> m_wheel_feedback;
 	output_finder<> m_drive_activity;
 	output_finder<> m_rtc_sqw;
+	// Modeled Vcc / green POWER LED (G2J-08). The green LED is the +5 Vcc
+	// power indicator, not a port-driven output (JR-OG startup step 3 "The
+	// green POWER LED will light"; JR-OG troubleshooting "green LED blinks
+	// only every five seconds" = sleep). LED state IS power state — the
+	// 5-second sleep flash is produced by the FIRMWARE's catnap re-arm chain
+	// ($9FE9 → $D26E/$D298 → $EC1E), never scripted here. The µs stamps and
+	// wake-cycle counter exist because a catnap wake pulse (boot-to-$EC2F)
+	// is shorter than the bridge's ~34 ms snapshot cadence — same telemetry
+	// pattern as the sonar INIT/echo stamps above.
+	output_finder<> m_power_led;
+	output_finder<> m_power_on_time_us;
+	output_finder<> m_power_off_time_us;
+	output_finder<> m_power_cycles;
 	// U214 CRB write latch (low six bits) for the bridge io snapshot: the
 	// $D823 read handler advances the wheel-feedback sample as a model side
 	// effect, so the observer composes from this output instead of reading
@@ -243,6 +264,38 @@ private:
 	// active transition (SQW through the U211D inverter, spec §1.4),
 	// cleared ONLY by a $D820 Peripheral Register A read (spec §2.3).
 	u8 m_u214_ca1_flag = 0;
+	// U214 CA2 (pin 39) modeled level: CRA bit 5 = 1, bit 4 = 1 puts CA2 in
+	// set/reset output mode with bit 3 as the level (6821 datasheet). The
+	// v1.6 ROM's exhaustive $D822 writer census is three STAA instructions:
+	// $EB8B (#$3B) and $EB95 (#$3F) — awake init, CA2 high — and $EC2F
+	// (#$37) — the sleep entry, the ONLY CA2-low write in the image. An
+	// undriven CA2 (reset/input mode) reads as high here: the latch below,
+	// not CA2's live level, holds the sleep state, and every operator boot
+	// crosses the pre-$EB8B window with CA2 undriven, so undriven ⇒ awake
+	// is a behavioral necessity (G2J-08 adjudication 2026-07-04).
+	u8 m_u214_ca2 = 1;
+	// U222 NAND-A/B sleep latch (wire-walked truth, conformance/
+	// AUDIT-2026-06.md commit ec6475d): U214 CA2 pin 39 → U222 NAND-A →
+	// NAND-B → U221 inverter → P201-14/P301-14 "+5 SHUTDOWN" → U302
+	// (LM3524) pin 10. Three inversions: CA2 LOW ⇒ logic 1 on U302-10 ⇒
+	// switching regulator (Vcc) off — JR-TM printed p. 21 / PDF p. 23
+	// verbatim: "the CPU normally keeps the shutdown line (U302-10) at
+	// logic 0 … the CPU will place a logic 1 on this line. This logic 1
+	// turns off Q301 to remove the 5-volt logic supply during the sleep
+	// mode." NAND-B out 9 feeds back into NAND-A pins 4/5, so the state
+	// LATCHES and survives CA2/CPU power loss; wake pulls a pulled-up
+	// (R209/R214) NAND-B input low from the RTC-IRQ*/reset side.
+	// true = latched off (Vcc down, CPU + interface ICs dead, Vca domain —
+	// RTC, retained RAM — alive).
+	bool m_sleep_latched = false;
+	// U213 IRQ* (pin 19) level as reported by the mc146818 irq() callback
+	// (1 = asserted/low). It feeds the U222 wake input through the R209
+	// pull-up (JR-TM printed p. 28 / PDF p. 30: "The IRQ interrupt output
+	// on U213-19 is used in the sleep mode to pulse the reset circuitry"),
+	// NOT the CPU IRQ net. While asserted it holds the wake-side NAND-B
+	// input low, so the latch can neither hold nor enter the sleep state.
+	u8 m_rtc_irq_asserted = 0;
+	u32 m_power_cycle_count = 0;
 	u8 m_acia_irq_state = 0;
 	u8 m_speech_data = 0;
 	u8 m_u215_ddr_a = 0;
@@ -320,6 +373,10 @@ void herojr_state::machine_start()
 	m_wheel_feedback.resolve();
 	m_drive_activity.resolve();
 	m_rtc_sqw.resolve();
+	m_power_led.resolve();
+	m_power_on_time_us.resolve();
+	m_power_off_time_us.resolve();
+	m_power_cycles.resolve();
 	m_u214_control_b_output.resolve();
 	m_rs232_status_output.resolve();
 	m_rs232_data_output.resolve();
@@ -337,6 +394,10 @@ void herojr_state::machine_start()
 	save_item(NAME(m_motion_detector_state));
 	save_item(NAME(m_rtc_sqw_level));
 	save_item(NAME(m_u214_ca1_flag));
+	save_item(NAME(m_u214_ca2));
+	save_item(NAME(m_sleep_latched));
+	save_item(NAME(m_rtc_irq_asserted));
+	save_item(NAME(m_power_cycle_count));
 	save_item(NAME(m_acia_irq_state));
 	save_item(NAME(m_speech_data));
 	save_item(NAME(m_u215_ddr_a));
@@ -390,6 +451,7 @@ void herojr_state::reset_interface_state()
 	m_u214_control_a = 0;
 	m_u214_control_b = 0;
 	m_u214_ca1_flag = 0; // 6821 reset clears the interrupt flags
+	m_u214_ca2 = 1; // reset puts CA2 in input mode: undriven ⇒ awake side
 	m_motion_detector_state = 0;
 	m_speech_data = 0;
 	m_u215_ddr_a = 0;
@@ -446,6 +508,99 @@ void herojr_state::reset_interface_state()
 	m_sonar_echo_timer->adjust(attotime::never);
 }
 
+// Latched-off consequence (G2J-08, blessed 2026-07-04): Vcc drops, so the
+// CPU and interface peripherals lose state and sit dead until wake. The Vca
+// domain survives untouched: the RTC keeps time with the armed alarm (JR-TM
+// printed p. 17 / PDF p. 19 — SW1 keeps U209/Vca alive "even with the Robot
+// in the sleep mode … power being applied to the real-time clock, reset
+// circuits, and address decoder"), and RAM contents persist, modeling the
+// JR-MAP "Retained during sleep" supply jumpering (stock J202 D-E, expanded
+// J202/J204 A-B + D-E) — the firmware's own sleep markers $0085/$0086 are
+// read back at $A0C1 on wake, so Heath's sleep feature presumes retention.
+// The CPU is held via INPUT_LINE_RESET (suspend-in-reset), which is also
+// the physical wake shape: "After the CPU comes out of the sleep mode, it
+// goes to the high end of memory (ROM)" — no resumed execution context.
+// The I/O window stays mapped: the held CPU cannot execute, so the only
+// possible accessors are the debugger/bridge apertures (sanctioned test
+// stimulus against the parked machine, G1J-06/G1J-07 re-shape blessing).
+void herojr_state::sleep_power_down()
+{
+	m_sleep_latched = true;
+	m_power_led = 0;
+	m_power_off_time_us = emulated_time_us(machine().time());
+	driver_tracef("sleep_power_down time_us=%d rtc_irq=%u", s32(m_power_off_time_us), m_rtc_irq_asserted);
+	// Vcc-domain state loss: PIAs, SC-01, ADC/sonar models, ACIA.
+	reset_interface_state();
+	m_acia->reset();
+	m_acia_irq_state = 0;
+	m_rs232_status = 0;
+	m_rs232_data = 0;
+	m_rs232_status_output = 0;
+	m_rs232_data_output = 0;
+	update_irq_line();
+	m_maincpu->set_input_line(INPUT_LINE_RESET, ASSERT_LINE);
+}
+
+// Wake = latch clear → regulator on → RESET-vector boot (rtc-spec §2.8
+// chain). The wake reset pulse reaches "the CPU and interface ICs" (JR-TM
+// printed p. 28 / PDF p. 30, verbatim) — NOT the RTC: the chip-level AF
+// flag must survive to the boot's single $A0C1 read (spec §2.7 CONFIRMED
+// wake adjudication), and the spec's own chain has IRQ* released by the
+// boot re-init $ED86 clearing AIE, not by RESET*. Only the operator RESET
+// key asserts RTC RESET* (set_reset_line below — JR-OG printed pp. 23/38:
+// pressing RESET also cancels the Alarm). Interface state was already
+// destroyed at power-down; releasing the held reset line boots the CPU
+// through $FFFE = $9FBE. The firmware then re-arms alarm = (now + 5) s and
+// re-sleeps if SW2 still reads SLEEP ($9FE9 → $D26E/$D298 → $EC1E) — THE
+// FIRMWARE produces the 5-second green-LED flash train; this model only
+// provides the power/latch/reset physics.
+void herojr_state::sleep_wake(const char *cause)
+{
+	m_sleep_latched = false;
+	m_power_cycle_count++;
+	m_power_led = 1;
+	m_power_on_time_us = emulated_time_us(machine().time());
+	m_power_cycles = s32(m_power_cycle_count & 0x7fffffff);
+	driver_tracef("sleep_wake cause=%s cycle=%u time_us=%d", cause, m_power_cycle_count, s32(m_power_on_time_us));
+	m_maincpu->set_input_line(INPUT_LINE_RESET, CLEAR_LINE);
+}
+
+// U213 IRQ* (pin 19) → R209 pull-up → U222 wake input (JR-TM printed p. 28
+// / PDF p. 30; rtc-spec §1.4: a power/wake control, never a CPU interrupt).
+// Asleep, an alarm match (AF ∧ AIE) pulls the wake input low, the U222
+// latch clears, and the regulator restarts — the 5-second catnap pulse.
+// Awake, the line is inert (the latch is already in the awake state and
+// the ROM never arms an interrupt outside the sleep path, spec §2.8).
+void herojr_state::rtc_irq_w(int state)
+{
+	const u8 previous = m_rtc_irq_asserted;
+	m_rtc_irq_asserted = state ? 1 : 0;
+	if (m_rtc_irq_asserted && m_sleep_latched)
+		sleep_wake("rtc_irq");
+	else if (previous && !m_rtc_irq_asserted && !m_sleep_latched && !m_u214_ca2)
+		// IRQ* release with CA2 still driven low: the held-high wake input
+		// drops away and the latch falls into the sleep state (physical
+		// completeness — the v1.6 ROM never reaches this ordering: $ED86
+		// clears AIE at boot, long before the $EC2F CA2-low write).
+		sleep_power_down();
+}
+
+// U214 CA2 follows CRA per the 6821 datasheet: bits 5/4 = 1 select
+// set/reset output mode with bit 3 as the driven level. A falling edge
+// while powered sets the U222 sleep latch (the ROM's $EC2F CRA = $37 sleep
+// entry); the latch cannot set while the RTC IRQ* wake input is asserted
+// (it holds NAND-B's output — net V — high regardless, AUDIT ec6475d
+// polarity walk). Undriven CA2 never sets the latch (see m_u214_ca2 note).
+void herojr_state::update_u214_ca2(u8 control)
+{
+	const bool driven = BIT(control, 5) && BIT(control, 4);
+	const u8 level = driven ? (BIT(control, 3) ? 1 : 0) : 1;
+	const u8 previous = m_u214_ca2;
+	m_u214_ca2 = level;
+	if (previous && !level && !m_sleep_latched && !m_rtc_irq_asserted)
+		sleep_power_down();
+}
+
 void herojr_state::set_reset_line(bool asserted)
 {
 	if (asserted)
@@ -469,6 +624,21 @@ void herojr_state::set_reset_line(bool asserted)
 
 void herojr_state::machine_reset()
 {
+	// Power-up: the U222 latch settles in the awake state — its wake-side
+	// inputs are R209/R214 10K pull-ups and CA2 is undriven until the ROM's
+	// $EB8B init (undriven ⇒ on: every operator boot crosses that window;
+	// G2J-08 adjudication 2026-07-04). Green LED = modeled Vcc, on.
+	m_sleep_latched = false;
+	m_rtc_irq_asserted = 0;
+	m_power_cycle_count = 0;
+	m_power_led = 1;
+	m_power_on_time_us = 0;
+	m_power_off_time_us = 0;
+	m_power_cycles = 0;
+	// A machine reset is a power cycle: release a sleep-held CPU reset line
+	// so the core boots normally (the panel RESET input path manages the
+	// line itself through set_reset_line).
+	m_maincpu->set_input_line(INPUT_LINE_RESET, CLEAR_LINE);
 	reset_interface_state();
 	m_acia_irq_state = 0;
 	m_rs232_status = 0;
@@ -497,16 +667,35 @@ void herojr_state::machine_reset()
 INPUT_CHANGED_MEMBER(herojr_state::sleep_norm_changed)
 {
 	driver_tracef("sleep_norm_changed old=%d new=%d", oldval, newval);
-	// SW2 is read by firmware at $D841 D6.  The operator manual's warm path is
-	// explicit: place SW2 in NORM, then press RESET.  Do not turn the switch
-	// edge itself into a firmware reset.
+	// SW2 is read by firmware at $D841 D6 and has NO direct wire into the
+	// U222 sleep latch (G2J-08 switch-edge adjudication, 2026-07-04):
+	// JR-OG printed p. 38 documents sleep with SW2 in NORM ("It will also
+	// go to sleep at times even while it is performing many of the other
+	// operations"), so a NORM-level latch clear is physically impossible,
+	// no edge-coupling component exists on the wire-walked wake nets
+	// (AUDIT ec6475d), and JR-TM printed p. 21 has the SLEEP direction
+	// CPU-mediated too ("the CPU will place a logic 1 on this line").
+	// Sliding to NORM wakes the robot (JR-OG p. 38) through the honest
+	// chain: the next ≤5 s catnap alarm pulse boots the CPU, its $9FE9
+	// check reads NORM, and the boot continues instead of re-sleeping —
+	// "usually, it will say something upon awakening" is that full boot's
+	// utterance. Do not turn the switch edge into a reset or latch clear.
 }
 
 INPUT_CHANGED_MEMBER(herojr_state::reset_changed)
 {
 	driver_tracef("reset_changed old=%d new=%d", oldval, newval);
-	if (oldval != newval)
-		set_reset_line(newval != 0);
+	if (oldval == newval)
+		return;
+	// The RESET key reaches the U222 wake side directly ("When the reset
+	// line is pulled low, U222A-9 goes high … turn on the 5-volt switching
+	// regulator", JR-TM printed p. 28 / PDF p. 30), so a press clears the
+	// sleep latch; the ensuing set_reset_line(true) also asserts RTC
+	// RESET* — the operator RESET is the one wake path that cancels a
+	// pending alarm at the chip (JR-OG printed pp. 23/38).
+	if (newval != 0 && m_sleep_latched)
+		sleep_wake("reset_key");
+	set_reset_line(newval != 0);
 }
 
 void herojr_state::mem_map(address_map &map)
@@ -808,6 +997,10 @@ u8 herojr_state::u214_control_b_r()
 void herojr_state::u214_control_a_w(u8 data)
 {
 	m_u214_control_a = data & 0x3f;
+	// CA2 (pin 39) drives the U222 sleep latch — the ROM's $EC2F CRA = $37
+	// write is the physical sleep entry (G2J-08). If it fires, the machine
+	// is latched off before the write below matters (state loss).
+	update_u214_ca2(data);
 	// CRA bit 0 gates IRQA* onto the CPU IRQ net (both U214 interrupt
 	// outputs sit on it, JR-SCH sheet 3 / spec §1.4), so a CRA rewrite can
 	// mask or expose a pending latched flag.
@@ -865,6 +1058,11 @@ void herojr_state::rtc_sqw_w(int state)
 		return;
 	m_rtc_sqw_level = level;
 	m_rtc_sqw = m_rtc_sqw_level;
+	// The SQW pin itself is Vca-domain (U213 keeps running asleep), but
+	// U211D/U214 are Vcc-powered: while the U222 latch holds the regulator
+	// off no CA1 flag can set (G2J-08 power model).
+	if (m_sleep_latched)
+		return;
 	const u8 ca1_level = m_rtc_sqw_level ? 0 : 1; // U211D inversion
 	const bool ca1_active_rising = BIT(m_u214_control_a, 1);
 	if ((ca1_active_rising && ca1_level) || (!ca1_active_rising && !ca1_level))
@@ -1327,11 +1525,13 @@ void herojr_state::herojr(machine_config &config)
 	RAM(config, m_ram).set_default_size("2K").set_extra_options("16K");
 
 	MC146818(config, m_rtc, 32.768_kHz_XTAL);
-	// SQW pin → U211D → U214 CA1 (rtc_sqw_w). The device's IRQ* pin
-	// (U213-19) is deliberately left unbound: on this board it feeds the
-	// U222A sleep-mode wake circuit, never the CPU IRQ net (JR-TM printed
-	// p. 28 / PDF p. 30; spec §1.4) — wake modeling is G2J-08 scope.
+	// SQW pin → U211D → U214 CA1 (rtc_sqw_w). IRQ* pin (U213-19) →
+	// R209 pull-up → U222 sleep-latch wake input (rtc_irq_w): on this
+	// board the RTC interrupt is a power/wake control, never a CPU
+	// interrupt (JR-TM printed p. 28 / PDF p. 30; rtc-spec §1.4;
+	// G2J-08 model, blessed 2026-07-04).
 	m_rtc->sqw().set(FUNC(herojr_state::rtc_sqw_w));
+	m_rtc->irq().set(FUNC(herojr_state::rtc_irq_w));
 
 	ACIA6850(config, m_acia, 0);
 	m_acia->irq_handler().set(FUNC(herojr_state::acia_irq_w));
