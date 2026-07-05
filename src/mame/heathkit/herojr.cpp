@@ -94,6 +94,7 @@ public:
 		m_power_off_time_us(*this, "herojr_power_off_time_us"),
 		m_power_cycles(*this, "herojr_power_cycles"),
 		m_u214_control_b_output(*this, "herojr_u214_control_b"),
+		m_u214_port_b_output(*this, "herojr_u214_port_b"),
 		m_rs232_status_output(*this, "herojr_rs232_status"),
 		m_rs232_data_output(*this, "herojr_rs232_data"),
 		m_ram_top(*this, "herojr_ram_top"),
@@ -111,7 +112,42 @@ protected:
 
 private:
 	static constexpr u16 HEROJR_SENSOR_BASE = 0xd860; // bridge injection aperture, not original hardware
-	static constexpr s16 HEROJR_STEERING_LIMIT_STEPS = 32;
+
+	// Steering geometry — the v1.6 ROM's own constants (hero-jr-adc-encoder-
+	// spec.md §5.3, blessed 2026-07-04; §7.3 remediation): travel = 1233
+	// steps limit-to-limit ($04D1, the value $D1E5 stores to $0579 at the D7
+	// limit hit; 0 at the D6 hit), straight-ahead center = 616 ($0268, the
+	// $ED27 center-seek target). The driver position is the mechanical
+	// shaft: it clamps at the hard stops and the limit switches assert
+	// exactly at the ends, so $F0F9 limit reads match the hardware
+	// trajectory at every position (the old ±32-step compression held a
+	// limit asserted through most of mid-travel, spec §7.3).
+	static constexpr s16 HEROJR_STEERING_SPAN_STEPS = 0x04d1;   // 1233
+	static constexpr s16 HEROJR_STEERING_CENTER_STEPS = 0x0268; // 616
+
+	// Wheel-encoder pulse generator (adc-encoder spec §7.1 remediation,
+	// blessed 2026-07-04). Scale: 146/64 = 2.281 encoder counts per inch —
+	// the BASIC cart's own LCF arithmetic at its 100% default (spec
+	// §5.2/§6 CONFIRMED; JR-BASIC printed 11 pins the unit as inches).
+	// Nominal ground speed: no manual or ROM value exists (spec §6 "Drive
+	// motor speed … not documented"; Part C Q3 resolved 2026-07-04 — no
+	// physical unit to measure), so the model drives at 10 in/s, an
+	// APPROXIMATION chosen as the round center (geometric mean ≈ 9.6) of
+	// the only Heath-derivable envelope: ≥ ~2 in/s (the Phase-E drive check
+	// must cross its ±400-count ≈ 31.3 in sonar window inside the
+	// 500-sample ≈ 15.6 s cap, spec §5.4) and ≤ ~44 in/s (the 74C221
+	// ~10 ms one-shot bounds distinguishable pulses near 100/s, spec
+	// §4.1/§6). Pulse rate = 2.281 counts/in × 10 in/s = 22.8125 =
+	// 1460/64 pulses per second; the period below holds the ratio exactly
+	// (attotime::from_ticks(64, 1460) = 64/1460 s per pulse).
+	static constexpr u32 HEROJR_WHEEL_PULSE_PERIOD_TICKS = 64;
+	static constexpr u32 HEROJR_WHEEL_PULSE_PERIOD_HZ = 1460;
+	// Spin-down tail: ≈ 2 s of continued pulses after drive enable drops —
+	// the pre-existing measured model constant, recorded as an
+	// APPROXIMATION (spec §7.2: a real wheel coasts, and an instant stop
+	// would re-quantize the cart's $725F busy-poll against hardware).
+	// 46 pulses ≈ 2.02 s at the nominal rate.
+	static constexpr u16 HEROJR_WHEEL_COAST_PULSES = 46;
 
 	DECLARE_DEVICE_IMAGE_LOAD_MEMBER(cart_load);
 	void mem_map(address_map &map) ATTR_COLD;
@@ -145,8 +181,7 @@ private:
 	bool drive_feedback_active() const;
 	u8 steering_limit_mask() const;
 	void update_steering_position(u8 data);
-	void advance_wheel_feedback_sample();
-	void update_drive_sonar_motion();
+	void emit_wheel_pulse();
 	u8 selected_adc_sample() const;
 	void start_adc_conversion();
 	void clock_adc_bit();
@@ -162,7 +197,7 @@ private:
 	void update_u214_ca2(u8 control);
 	void sleep_power_down();
 	void sleep_wake(const char *cause);
-	TIMER_CALLBACK_MEMBER(wheel_feedback_tick);
+	TIMER_CALLBACK_MEMBER(wheel_pulse_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 
 	template <typename... FormatParams>
@@ -224,6 +259,8 @@ private:
 	output_finder<> m_motor_head;
 	output_finder<> m_motor_arm;
 	output_finder<> m_motion_detector;
+	// Wheel CB1 latched-flag state (0/1 since the §7.1 remediation — was a
+	// 0-3 sample counter): the plugin composes $D823 bit 7 from this.
 	output_finder<> m_wheel_feedback;
 	output_finder<> m_drive_activity;
 	output_finder<> m_rtc_sqw;
@@ -241,10 +278,19 @@ private:
 	output_finder<> m_power_off_time_us;
 	output_finder<> m_power_cycles;
 	// U214 CRB write latch (low six bits) for the bridge io snapshot: the
-	// $D823 read handler advances the wheel-feedback sample as a model side
-	// effect, so the observer composes from this output instead of reading
-	// the bus (plugin herojr_d823_snapshot).
+	// observer composes $D823 from this output plus the wheel CB1 flag
+	// (herojr_wheel_feedback) instead of bus-reading (plugin
+	// herojr_d823_snapshot) — output-driven observation stays the rule even
+	// though the $D823 read handler is side-effect-free since the §7.1
+	// remediation (2026-07-05).
 	output_finder<> m_u214_control_b_output;
+	// U214 port B output latch ($D821 low seven bits) for the bridge io
+	// snapshot: a $D821 Peripheral Register B read clears the latched wheel
+	// IRQB1 flag (6821 rule, spec §5.1), so the every-frame observer must
+	// compose instead of bus-reading (plugin herojr_d821_snapshot — the
+	// recompose the 2026-07-03 side-effect audit reserved for the day U214
+	// grew latched flags).
+	output_finder<> m_u214_port_b_output;
 	output_finder<> m_rs232_status_output;
 	output_finder<> m_rs232_data_output;
 	// Top of populated RAM ($07FF stock / $3FFF expanded) for bridge truth.
@@ -309,8 +355,23 @@ private:
 	u8 m_sonar_echo_state = 0;
 	u32 m_phoneme_seq_count = 0;
 	u32 m_phoneme_clip_count = 0;
-	u8 m_wheel_feedback_sample = 0;
-	u16 m_wheel_feedback_port_a_count = 0;
+	// U214 IRQB1: the 6821-latched CB1 flag ($D823 bit 7) — one wheel-
+	// encoder pulse (A3 sensor → 74C221 one-shot → CB1, adc-encoder spec
+	// §4.1/§5.1). Set by the pulse generator, cleared ONLY by a $D821
+	// Peripheral Register B read (the ROM's own $D19E odometer service),
+	// contributing flag ∧ CRB.0 to the CPU IRQ line — the CA1 model
+	// (d2b1e46329f) applied to the wheel channel (spec §7.1).
+	u8 m_u214_cb1_flag = 0;
+	// Coast-tail pulses left after drive enable dropped (spec §7.2).
+	u16 m_wheel_coast_remaining = 0;
+	// World-model travel accumulator: 64 added per pulse, 1 inch per 146 —
+	// counts × 64⁄146 = inches, the exact inverse of the cart's
+	// counts = n × 146⁄64 LCF arithmetic (spec §5.2/§6), so odometer and
+	// sonar-observed travel agree as they do on hardware (spec §7.4).
+	u8 m_wheel_travel_accum = 0;
+	// Last commanded direction relay state (D0) while drive was enabled —
+	// the coast tail keeps rolling the way the robot was moving.
+	u8 m_drive_direction = 0;
 	u8 m_light_sample = 50;
 	u8 m_sound_sample = 0;
 	u8 m_sonar_distance_sample = 48;
@@ -321,10 +382,17 @@ private:
 	u8 m_rs232_status = 0;
 	u8 m_rs232_data = 0;
 	u32 m_drive_activity_count = 0;
-	s16 m_steering_position = 0;
+	// Mechanical steering shaft position, 0 (D6 limit) … 1233 (D7 limit),
+	// spec §5.3 geometry. A mechanical position, NOT interface state: it
+	// persists through reset_interface_state (RESET presses, sleep
+	// power-down — the shaft does not move when Vcc drops). Power-up rest
+	// position is modeled at center (APPROXIMATION — a real unit rests
+	// wherever it was last left; the firmware learns the truth at its
+	// first limit seek, which re-syncs $0579 exactly as on hardware).
+	s16 m_steering_position = HEROJR_STEERING_CENTER_STEPS;
 	u8 m_steering_phase = 0;
 	bool m_driver_trace = false;
-	emu_timer *m_wheel_feedback_timer = nullptr;
+	emu_timer *m_wheel_pulse_timer = nullptr;
 	emu_timer *m_sonar_echo_timer = nullptr;
 };
 
@@ -378,6 +446,7 @@ void herojr_state::machine_start()
 	m_power_off_time_us.resolve();
 	m_power_cycles.resolve();
 	m_u214_control_b_output.resolve();
+	m_u214_port_b_output.resolve();
 	m_rs232_status_output.resolve();
 	m_rs232_data_output.resolve();
 	m_port_outputs.resolve();
@@ -411,8 +480,10 @@ void herojr_state::machine_start()
 	save_item(NAME(m_sonar_echo_state));
 	save_item(NAME(m_phoneme_seq_count));
 	save_item(NAME(m_phoneme_clip_count));
-	save_item(NAME(m_wheel_feedback_sample));
-	save_item(NAME(m_wheel_feedback_port_a_count));
+	save_item(NAME(m_u214_cb1_flag));
+	save_item(NAME(m_wheel_coast_remaining));
+	save_item(NAME(m_wheel_travel_accum));
+	save_item(NAME(m_drive_direction));
 	save_item(NAME(m_light_sample));
 	save_item(NAME(m_sound_sample));
 	save_item(NAME(m_sonar_distance_sample));
@@ -426,7 +497,7 @@ void herojr_state::machine_start()
 	save_item(NAME(m_steering_position));
 	save_item(NAME(m_steering_phase));
 
-	m_wheel_feedback_timer = timer_alloc(FUNC(herojr_state::wheel_feedback_tick), this);
+	m_wheel_pulse_timer = timer_alloc(FUNC(herojr_state::wheel_pulse_tick), this);
 	m_sonar_echo_timer = timer_alloc(FUNC(herojr_state::sonar_echo_tick), this);
 }
 
@@ -463,8 +534,12 @@ void herojr_state::reset_interface_state()
 	m_adc_bits_remaining = 0;
 	m_adc_output_state = 0;
 	m_sonar_echo_state = 0;
-	m_wheel_feedback_sample = 0;
-	m_wheel_feedback_port_a_count = 0;
+	m_u214_cb1_flag = 0; // 6821 reset clears the interrupt flags
+	m_wheel_coast_remaining = 0;
+	m_wheel_travel_accum = 0;
+	m_drive_direction = 0;
+	// m_steering_position deliberately NOT reset: the shaft is mechanical
+	// state and survives interface resets / Vcc loss (see the member note).
 	m_light_sample = m_light_level->read() & 0xff;
 	m_sound_sample = m_sound_level->read() & 0xff;
 	m_sonar_distance_sample = m_sonar_distance->read() & 0xff;
@@ -474,7 +549,6 @@ void herojr_state::reset_interface_state()
 	m_speech_request_flag_output = 0;
 	m_speech_strobe_state = 0;
 	m_drive_activity_count = 0;
-	m_steering_position = 0;
 	m_steering_phase = 0;
 	m_speech_phoneme = 0;
 	m_speech_inflection = 0;
@@ -503,6 +577,7 @@ void herojr_state::reset_interface_state()
 	m_wheel_feedback = 0;
 	m_drive_activity = 0;
 	m_u214_control_b_output = 0;
+	m_u214_port_b_output = 0;
 	for (int port = 0; port < 8; port++)
 		m_port_outputs[port] = 0;
 	m_sonar_echo_timer->adjust(attotime::never);
@@ -654,13 +729,15 @@ void herojr_state::machine_reset()
 	// $26/$02 seed contradicted those ROM values and was dead within
 	// milliseconds).
 	update_irq_line();
-	// Wheel-feedback/world-model pacing timer. 1024 Hz is this driver's
-	// pre-existing mechanical-model constant (2048-tick coast tail ≈ 2 s,
-	// G1J-04/G1J-05 measured basis) — it is NOT the RTC tick: the real
-	// SQW interrupt path runs at 256 Hz through the mc146818 sqw()
-	// callback (rtc_sqw_w), and tying the drive model to it would silently
-	// re-time drive pacing 4x (spec §3.1 co-move note).
-	m_wheel_feedback_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
+	// Wheel-encoder pulse generator cadence (adc-encoder spec §7.1): the
+	// 1460/64 = 22.8125 pulses/s nominal-speed rate (constants block at
+	// the top; 2.281 counts/in × 10 in/s, both cited there). The old
+	// 1024 Hz pacing timer and its read-advancing sample counter are
+	// retired (spec §7.2 sanctioned the retirement; the ≈2 s coast tail
+	// survives as HEROJR_WHEEL_COAST_PULSES). Still deliberately NOT the
+	// RTC tick path — that stays rtc_sqw_w's domain (spec §3.1 co-move).
+	const attotime wheel_pulse_period = attotime::from_ticks(HEROJR_WHEEL_PULSE_PERIOD_TICKS, HEROJR_WHEEL_PULSE_PERIOD_HZ);
+	m_wheel_pulse_timer->adjust(wheel_pulse_period, 0, wheel_pulse_period);
 	driver_tracef("machine_reset sleep_norm=%u speech_request=%u rtc_sqw=%u", m_sleep_norm->read(), m_speech_request, m_rtc_sqw_level);
 }
 
@@ -672,7 +749,7 @@ INPUT_CHANGED_MEMBER(herojr_state::sleep_norm_changed)
 	// JR-OG printed p. 38 documents sleep with SW2 in NORM ("It will also
 	// go to sleep at times even while it is performing many of the other
 	// operations"), so a NORM-level latch clear is physically impossible,
-	// no edge-coupling component exists on the wire-walked wake nets
+	// no edge-coupling component exists on the walked extent of the wake nets
 	// (AUDIT ec6475d), and JR-TM printed p. 21 has the SLEEP direction
 	// CPU-mediated too ("the CPU will place a logic 1 on this line").
 	// Sliding to NORM wakes the robot (JR-OG p. 38) through the honest
@@ -820,7 +897,7 @@ u8 herojr_state::u214_port_a_r()
 		m_u214_ca1_flag = 0;
 		update_irq_line();
 	}
-	driver_tracef("u214_port_a_r data=$%02X port_a=$%02X wheel_feedback=%u feedback_count=%u", data, m_u214_port_a, m_wheel_feedback_sample, m_wheel_feedback_port_a_count);
+	driver_tracef("u214_port_a_r data=$%02X port_a=$%02X wheel_cb1_flag=%u", data, m_u214_port_a, m_u214_cb1_flag);
 	return data;
 }
 
@@ -856,6 +933,20 @@ u8 herojr_state::keypad_matrix_r()
 
 u8 herojr_state::u214_port_b_r()
 {
+	// 6821 datasheet: a Peripheral Register B read clears the latched
+	// IRQB1 flag (and releases IRQB*) — here the wheel-encoder CB1 latch
+	// (adc-encoder spec §5.1). This is the ONLY clear on real silicon, and
+	// the v1.6 ROM leans on it: the $D17F IRQ dispatcher's odometer
+	// service ($D19E) ends in exactly this read after counting the pulse
+	// at $05A1:$05A2. (U214 has no DDR routing model — tech-debt item 7 —
+	// so every read here is a peripheral-register read.) Debugger/UI reads
+	// are guarded, matching the U215 sonar-echo and U214 CA1 clears.
+	if (!machine().side_effects_disabled() && m_u214_cb1_flag)
+	{
+		m_u214_cb1_flag = 0;
+		m_wheel_feedback = 0;
+		update_irq_line();
+	}
 	return (m_u214_port_b & 0x7f) | (m_motion_detector_state ? 0x00 : 0x80);
 }
 
@@ -864,13 +955,17 @@ bool herojr_state::drive_feedback_active() const
 	return BIT(m_u214_port_b, 1);
 }
 
+// Limit switches at the mechanical ends of the ROM's own travel coding
+// (spec §5.3): D7 limit at position 1233 ($04D1 — the mode-1 seek target),
+// D6 limit at position 0 (the mode-2 seek target). Active-low at the raw
+// $D820 port; keypad_matrix_r applies the mask while a phase is energized.
 u8 herojr_state::steering_limit_mask() const
 {
 	if (m_steering_phase == 0)
 		return 0x00;
-	if (m_steering_position >= HEROJR_STEERING_LIMIT_STEPS)
+	if (m_steering_position >= HEROJR_STEERING_SPAN_STEPS)
 		return 0x80;
-	if (m_steering_position <= -HEROJR_STEERING_LIMIT_STEPS)
+	if (m_steering_position <= 0)
 		return 0x40;
 	return 0x00;
 }
@@ -901,32 +996,52 @@ void herojr_state::update_steering_position(u8 data)
 
 	if (previous_index >= 0 && previous_index != current_index)
 	{
+		// One step per adjacent phase transition, clamped at the hard
+		// stops: forward table order ($0C→$18→$30→$24, the ROM's mode-1/
+		// dir-1 rotate-left emission) walks toward the D7 limit at 1233,
+		// reverse toward the D6 limit at 0 (spec §5.3).
 		const int delta = (current_index - previous_index + 4) & 0x03;
 		if (delta == 1)
-			m_steering_position = std::min<s16>(HEROJR_STEERING_LIMIT_STEPS, m_steering_position + 1);
+			m_steering_position = std::min<s16>(HEROJR_STEERING_SPAN_STEPS, m_steering_position + 1);
 		else if (delta == 3)
-			m_steering_position = std::max<s16>(-HEROJR_STEERING_LIMIT_STEPS, m_steering_position - 1);
+			m_steering_position = std::max<s16>(0, m_steering_position - 1);
 	}
 
 	m_steering_phase = phase;
 }
 
-void herojr_state::advance_wheel_feedback_sample()
+// One wheel-encoder pulse: the reflective sensor A3 → 74C221 one-shot →
+// U214 CB1 chain (spec §4.1). The one-shot's ~10 ms fixed width
+// (R322/C318 — MEDIUM/APPROXIMATION in the spec) sits far below the
+// 43.8 ms pulse period, so both CB1 edges occur within every pulse and the
+// 6821 latches once per pulse under either CRB bit-1 polarity; the
+// sub-period edge timing is not modeled (no ROM consumer times it — the
+// odometer counts pulses, spec §5.1/§5.2).
+void herojr_state::emit_wheel_pulse()
 {
-	m_wheel_feedback_sample = (m_wheel_feedback_sample + 1) & 0x03;
-	m_wheel_feedback = m_wheel_feedback_sample;
-	driver_tracef("advance_wheel_feedback_sample sample=%u active=%u feedback_count=%u port_b=$%02X", m_wheel_feedback_sample, drive_feedback_active() ? 1 : 0, m_wheel_feedback_port_a_count, m_u214_port_b);
-}
+	m_u214_cb1_flag = 1;
+	m_wheel_feedback = 1;
+	update_irq_line();
+	driver_tracef("emit_wheel_pulse coast_remaining=%u travel_accum=%u port_b=$%02X control_b=$%02X", m_wheel_coast_remaining, m_wheel_travel_accum, m_u214_port_b, m_u214_control_b);
 
-void herojr_state::update_drive_sonar_motion()
-{
-	if (!BIT(m_u214_port_b, 1) || (m_u214_port_b & 0x3f) == 0x3f)
+	// World-model travel rides the same pulse train (spec §7.4 "one speed,
+	// two consumers"): 64 accumulated per pulse, one modeled inch per 146 —
+	// counts × 64⁄146 = inches, the exact inverse of the cart's
+	// counts = n × 146⁄64 arithmetic (spec §5.2/§6) — so the Phase-E drive
+	// check and the odometer agree about how far the robot moved, as on
+	// hardware. The $3F latch image is the U214 DDR-byte transient
+	// (tech-debt item 7), not motion — skip it, as the old model did.
+	if ((m_u214_port_b & 0x3f) == 0x3f)
 		return;
-
-	m_sonar_distance_sample = BIT(m_u214_port_b, 0)
-		? std::min<u8>(96, m_sonar_distance_sample + 1)
-		: std::max<u8>(1, m_sonar_distance_sample - 1);
-	m_sonar_distance_output = m_sonar_distance_sample;
+	m_wheel_travel_accum += 64;
+	if (m_wheel_travel_accum >= 146)
+	{
+		m_wheel_travel_accum -= 146;
+		m_sonar_distance_sample = m_drive_direction
+			? std::min<u8>(96, m_sonar_distance_sample + 1)
+			: std::max<u8>(1, m_sonar_distance_sample - 1);
+		m_sonar_distance_output = m_sonar_distance_sample;
+	}
 }
 
 // Pure output-latch write: every byte updates the scan latch, exactly as
@@ -940,7 +1055,9 @@ void herojr_state::u214_port_a_w(u8 data)
 
 void herojr_state::u214_port_b_w(u8 data)
 {
+	const bool was_driving = drive_feedback_active();
 	m_u214_port_b = data & 0x7f;
+	m_u214_port_b_output = m_u214_port_b;
 	update_steering_position(data);
 	if ((m_u214_port_b & 0x3e) != 0)
 	{
@@ -949,14 +1066,19 @@ void herojr_state::u214_port_b_w(u8 data)
 	}
 	if (drive_feedback_active())
 	{
-		m_wheel_feedback_port_a_count = 2048;
-		advance_wheel_feedback_sample();
+		// Drive enable live: encoder pulses come only from the generator —
+		// a $D821 write is not an encoder event (the pre-remediation
+		// per-write sample advance is retired, spec §7.1). Track the
+		// commanded direction for the world model and cancel any pending
+		// coast tail (the motor is powered again).
+		m_drive_direction = BIT(data, 0) ? 1 : 0;
+		m_wheel_coast_remaining = 0;
 	}
-	else
+	else if (was_driving)
 	{
-		m_wheel_feedback_port_a_count = 0;
-		m_wheel_feedback_sample = 0;
-		m_wheel_feedback = 0;
+		// D1 falling edge: the wheel spins down — ≈2 s of continued
+		// pulses (spec §7.2 coast-tail APPROXIMATION, constant above).
+		m_wheel_coast_remaining = HEROJR_WHEEL_COAST_PULSES;
 	}
 	// HERO Jr Technical Manual: $D821 D1 controls main drive motor A2,
 	// D0 controls relay RY301 for direction, and D2-D5 drive steering phases.
@@ -964,7 +1086,7 @@ void herojr_state::u214_port_b_w(u8 data)
 	m_motor_right = BIT(data, 0) ? 1 : 0;
 	m_port_outputs[3] = (data & 0x3c) << 2;
 	m_port_outputs[5] = (BIT(data, 1) ? 0x40 : 0x00) | (BIT(data, 0) ? 0x80 : 0x00);
-	driver_tracef("u214_port_b_w data=$%02X latched=$%02X drive_activity=%u wheel_feedback=%u feedback_count=%u steering_position=%d steering_limit=$%02X", data, m_u214_port_b, m_drive_activity_count, m_wheel_feedback_sample, m_wheel_feedback_port_a_count, m_steering_position, steering_limit_mask());
+	driver_tracef("u214_port_b_w data=$%02X latched=$%02X drive_activity=%u cb1_flag=%u coast_remaining=%u steering_position=%d steering_limit=$%02X", data, m_u214_port_b, m_drive_activity_count, m_u214_cb1_flag, m_wheel_coast_remaining, m_steering_position, steering_limit_mask());
 	update_u214_input_outputs();
 }
 
@@ -984,14 +1106,19 @@ u8 herojr_state::u214_control_a_r()
 	return (m_u214_control_a & 0x3f) | (m_u214_ca1_flag ? 0x80 : 0x00);
 }
 
+// $D823 = U214 CRB readback, real 6821 semantics (mirrors $D822/$D843):
+// bits 5-0 return the written control byte; bit 6 (IRQB2) reads 0 because
+// every CRB value the v1.6 ROM writes has bit 5 = 1 (CB2 — the sonar INIT
+// line — in output mode, which holds IRQB2 clear per the datasheet); bit 7
+// is the LATCHED IRQB1 flag — one wheel-encoder pulse (spec §5.1), the
+// $D17F dispatcher's dispatch bit (LDAA $D823 / BITA #$80). A CRB read
+// never clears the flag and has no model side effects: the
+// pre-remediation read-advancing sample counter (which made the odometer
+// tick ≈128 counts/s regardless of commanded travel, spec §7.1) is
+// retired.
 u8 herojr_state::u214_control_b_r()
 {
-	if (drive_feedback_active() || m_wheel_feedback_port_a_count != 0)
-		advance_wheel_feedback_sample();
-	else
-		m_wheel_feedback_sample = 0;
-	m_wheel_feedback = m_wheel_feedback_sample;
-	return (m_u214_control_b & 0x3f) | (BIT(m_wheel_feedback_sample, 0) ? 0x80 : 0x00);
+	return (m_u214_control_b & 0x3f) | (m_u214_cb1_flag ? 0x80 : 0x00);
 }
 
 void herojr_state::u214_control_a_w(u8 data)
@@ -1014,28 +1141,32 @@ void herojr_state::u214_control_b_w(u8 data)
 	m_u214_control_b_output = m_u214_control_b;
 	if (!BIT(previous_control, 3) && BIT(m_u214_control_b, 3))
 		arm_sonar_cycle();
+	// CRB bit 0 gates IRQB* onto the shared CPU IRQ net (spec §5.1: the
+	// boot's CRB = $37 enables the per-pulse odometer interrupt; the sonar
+	// INIT sequences park bit 0 low and a pulse latched meanwhile asserts
+	// when the ROM restores $37 — 6821 rule, same as the CRA path).
+	update_irq_line();
 }
 
 void herojr_state::update_u214_input_outputs()
 {
 	m_motion_detector = m_motion_detector_state;
-	if (!drive_feedback_active() && m_wheel_feedback_port_a_count == 0)
-	{
-		m_wheel_feedback_sample = 0;
-		m_wheel_feedback = 0;
-	}
 }
 
 // CPU IRQ* net: U214 IRQA*/IRQB* and the ACIA interrupt share it (JR-SCH
 // sheet 3; spec §1.4). U214's contribution is the 6821 rule — latched flag
-// AND its CRA enable bit. The RTC's own IRQ* pin (U213-19) is NOT on this
-// net: it feeds the sleep-mode wake circuit (U222A) only, which is G2J-08
-// scope. (U215's IRQA wiring to the CPU awaits JR-TM adjudication,
+// AND its control-register enable bit, for BOTH sides: IRQA1 (the 256 Hz
+// RTC tick through CA1) and IRQB1 (the wheel-encoder pulse through CB1,
+// adc-encoder spec §5.1 — "every wheel-encoder pulse interrupts the CPU",
+// the $D17F dispatcher's first check). The RTC's own IRQ* pin (U213-19) is
+// NOT on this net: it feeds the sleep-mode wake circuit (U222A) only
+// (G2J-08). (U215's IRQA wiring to the CPU awaits JR-TM adjudication,
 // tech-debt §2 — unchanged here.)
 void herojr_state::update_irq_line()
 {
 	const bool u214_irq_a = m_u214_ca1_flag && BIT(m_u214_control_a, 0);
-	m_maincpu->set_input_line(INPUT_LINE_IRQ0, (u214_irq_a || m_acia_irq_state) ? ASSERT_LINE : CLEAR_LINE);
+	const bool u214_irq_b = m_u214_cb1_flag && BIT(m_u214_control_b, 0);
+	m_maincpu->set_input_line(INPUT_LINE_IRQ0, (u214_irq_a || u214_irq_b || m_acia_irq_state) ? ASSERT_LINE : CLEAR_LINE);
 }
 
 // U213 SQW (pin 23) → U211D inverter → U214 CA1 (pin 40): "The output of
@@ -1072,21 +1203,25 @@ void herojr_state::rtc_sqw_w(int state)
 	}
 }
 
-// Mechanical world-model pacing (wheel feedback + drive-coupled sonar
-// distance). 1024 Hz and the 2048-tick coast tail are this driver's
-// pre-existing model constants (G1J-04/G1J-05 measured basis); the timer
-// deliberately does NOT touch the CPU IRQ line or the RTC tick path —
-// those belong to rtc_sqw_w above (spec §3.1 co-move).
-TIMER_CALLBACK_MEMBER(herojr_state::wheel_feedback_tick)
+// Wheel-encoder pulse generator (adc-encoder spec §7.1): fires at the
+// documented nominal-speed pulse cadence (22.8125/s, constants block).
+// Pulses are generated while drive enable ($D821 D1) is active and through
+// the ≈2 s coast tail after it drops; each one is a real CB1 event —
+// latched IRQB1, CPU IRQ per CRB bit 0, odometer increment through the
+// ROM's own $D17F/$D19E service — never a bridge injection, and the pulse
+// count now tracks the mechanical model's travel instead of the retired
+// read-advancing toggle. This asserts the CPU IRQ line by design (the
+// hardware wheel channel is an interrupt source, spec §5.1); the RTC tick
+// path stays rtc_sqw_w's domain.
+TIMER_CALLBACK_MEMBER(herojr_state::wheel_pulse_tick)
 {
-	if (drive_feedback_active() || m_wheel_feedback_port_a_count != 0)
+	if (drive_feedback_active())
+		emit_wheel_pulse();
+	else if (m_wheel_coast_remaining != 0)
 	{
-		advance_wheel_feedback_sample();
-		if (!drive_feedback_active() && m_wheel_feedback_port_a_count != 0)
-			m_wheel_feedback_port_a_count--;
+		m_wheel_coast_remaining--;
+		emit_wheel_pulse();
 	}
-	update_drive_sonar_motion();
-	update_u214_input_outputs();
 }
 
 u8 herojr_state::u215_speech_data_r()
