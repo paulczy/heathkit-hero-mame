@@ -14,7 +14,11 @@
     - 6850 ACIA cassette/serial-style interface
     - 6 seven-segment LED digits
     - 17-key keypad
-    - Sonar/light/sound/motion sensors and motor/arm/head outputs
+    - Sonar/light/sound/motion sensors
+    - Motion model per hero-1-motion-spec.md (blessed 2026-07-06): seven
+      stepper axes as phase-followers with position-derived limit
+      switches, plus the DC drive wheel with a real encoder-pulse path
+      into the $40 WHEEL DET interrupt
 
     TODO:
     - Replace remaining scaffold PIA aliases with exact board behavior.
@@ -74,6 +78,7 @@ public:
 		m_basic_baud(*this, "BASIC_BAUD"),
 		m_digits(*this, "hero1_led_digit_%u", 0U),
 		m_axis_positions(*this, "hero1_axis_position_%u", 0U),
+		m_wheel_pulses_out(*this, "hero1_wheel_pulses"),
 		m_speech_phoneme(*this, "hero1_speech_phoneme"),
 		m_speech_inflection(*this, "hero1_speech_inflection"),
 		m_speech_strobe(*this, "hero1_speech_strobe"),
@@ -168,6 +173,28 @@ private:
 		}
 	}
 
+	// ------------------------------------------------------------------
+	// Drive-wheel model (spec §4 P3): DC PM motor decoded from the $C2A0
+	// latch (D7 direction relay K801, D6 ON/OFF, D5-D0 speed DAC), wheel
+	// travel integrated as encoder pulses through the modeled 74221
+	// one-shot into the $40 WHEEL DET interrupt (spec §1.3/§1.6/§2.5).
+	// ------------------------------------------------------------------
+
+	// CONFIRMED cart arithmetic (spec §5 Q1 resolution 2026-07-06): the
+	// HERO-1 BASIC cart converts FWD/BWD inches to encoder pulses as
+	// pulses = inches x [$42]/64 with the seeded default $6D = 109
+	// (hero1_basic.bin $B2C5 conversion, $B1DA seed).
+	static constexpr double WHEEL_PULSES_PER_INCH = 109.0 / 64.0;
+
+	// APPROXIMATION A1 (spec §5 Q2, adopted 2026-07-06): no manual states
+	// a ground speed, so the DAC-to-speed map is a labeled nominal — 10
+	// in/s at DAC 63 (the Jr 10 in/s precedent), 2.5 in/s at DAC 0 (the
+	// ROM's $40 "slow" is ON + DAC 0 and must move), affine between.
+	// Resulting pulse rates (~4.3-17 pulses/s) sit far below the 74221
+	// one-shot's ~140 pulses/s ceiling (spec §3.2).
+	static constexpr double WHEEL_SPEED_DAC0_IN_PER_S = 2.5;
+	static constexpr double WHEEL_SPEED_DAC63_IN_PER_S = 10.0;
+
 	void mem_map(address_map &map) ATTR_COLD;
 
 	u8 display_memory_r(offs_t offset);
@@ -213,6 +240,8 @@ private:
 	void axis_apply_pattern(int axis, u8 pattern);
 	void axis_energize(int axis);
 	void axis_step(int axis, int direction);
+	void update_drive_model();
+	attotime wheel_pulse_period() const;
 	void update_irq_line();
 	void update_pendant_port(u8 data);
 	void set_pendant_function(bool arm);
@@ -224,6 +253,7 @@ private:
 	void update_speech_power();
 	TIMER_CALLBACK_MEMBER(executive_timer_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
+	TIMER_CALLBACK_MEMBER(wheel_pulse_tick);
 
 	template <typename... FormatParams>
 	void driver_tracef(const char *format, FormatParams &&... args)
@@ -250,6 +280,7 @@ private:
 
 	output_finder<6> m_digits;
 	output_finder<AXIS_COUNT> m_axis_positions;
+	output_finder<> m_wheel_pulses_out;
 	output_finder<> m_speech_phoneme;
 	output_finder<> m_speech_inflection;
 	output_finder<> m_speech_strobe;
@@ -282,6 +313,8 @@ private:
 	s32 m_axis_pos[AXIS_COUNT]{};      // modeled mechanical microsteps (0..span); board state, survives reset
 	u8 m_axis_pattern[AXIS_COUNT]{};   // detent pattern the rotor last followed (0 = no memory)
 	u8 m_group_pattern[PGROUP_COUNT]{}; // currently energized nibble per pattern circuit (0 = off)
+	u32 m_wheel_pulses = 0;            // total encoder pulses ever (the disc never resets); board state
+	bool m_wheel_pulse_pending = false;
 	u8 m_clock_address = 0;
 	u8 m_clock_control = 0;
 	u8 m_pendant_port = 0x8e;  // ET-18 teaching pendant read byte at $C280; idle ARM/N/released
@@ -289,6 +322,7 @@ private:
 	bool m_driver_trace = false;
 	emu_timer *m_executive_timer = nullptr;
 	emu_timer *m_sonar_timer = nullptr;
+	emu_timer *m_wheel_timer = nullptr;
 };
 
 void hero1_state::machine_start()
@@ -309,6 +343,7 @@ void hero1_state::machine_start()
 
 	m_digits.resolve();
 	m_axis_positions.resolve();
+	m_wheel_pulses_out.resolve();
 	m_speech_phoneme.resolve();
 	m_speech_inflection.resolve();
 	m_speech_strobe.resolve();
@@ -341,6 +376,8 @@ void hero1_state::machine_start()
 	save_item(NAME(m_axis_pos));
 	save_item(NAME(m_axis_pattern));
 	save_item(NAME(m_group_pattern));
+	save_item(NAME(m_wheel_pulses));
+	save_item(NAME(m_wheel_pulse_pending));
 	save_item(NAME(m_clock_address));
 	save_item(NAME(m_clock_control));
 	save_item(NAME(m_pendant_port));
@@ -359,9 +396,12 @@ void hero1_state::machine_start()
 	}
 	for (u8 &pattern : m_group_pattern)
 		pattern = 0;
+	m_wheel_pulses = 0;
+	m_wheel_pulses_out = 0;
 
 	m_executive_timer = timer_alloc(FUNC(hero1_state::executive_timer_tick), this);
 	m_sonar_timer = timer_alloc(FUNC(hero1_state::sonar_echo_tick), this);
+	m_wheel_timer = timer_alloc(FUNC(hero1_state::wheel_pulse_tick), this);
 	driver_tracef("machine_start trace enabled");
 }
 
@@ -426,6 +466,10 @@ void hero1_state::machine_reset()
 	update_irq_line();
 	m_executive_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
 	m_sonar_timer->adjust(attotime::never);
+	// The drive latch was just cleared (D6 = 0, motor off): no pulses.
+	// The odometer count itself is mechanical state and survives.
+	m_wheel_timer->adjust(attotime::never);
+	m_wheel_pulse_pending = false;
 }
 
 void hero1_state::mem_map(address_map &map)
@@ -792,6 +836,7 @@ void hero1_state::port_c2a0_main_drive_w(u8 data)
 	m_manual_port_out[5] = data;
 	m_port_outputs[5] = data;
 	driver_tracef("port_c2a0_main_drive_w data=$%02X direction=%u on=%u dac=%u", data, BIT(data, 7), BIT(data, 6), data & 0x3f);
+	update_drive_model();
 }
 
 void hero1_state::port_c2c0_select_strobe_w(u8 data)
@@ -993,6 +1038,54 @@ void hero1_state::axis_energize(int axis)
 {
 	const u8 pattern = m_group_pattern[AXES[axis].group];
 	m_axis_pattern[axis] = (phase_index(pattern) >= 0) ? pattern : 0;
+}
+
+attotime hero1_state::wheel_pulse_period() const
+{
+	// Speed follows the latch, so the ROM's own ramp ($F074 writes every
+	// intermediate byte to $C2A0) produces a ramping pulse rate; each
+	// pulse boundary picks up the current DAC value. Speed map is the
+	// labeled A1 approximation (constants above); pulses-per-inch is the
+	// CONFIRMED cart calibration.
+	const u8 dac = m_manual_port_out[5] & 0x3f;
+	const double inches_per_second = WHEEL_SPEED_DAC0_IN_PER_S
+			+ (WHEEL_SPEED_DAC63_IN_PER_S - WHEEL_SPEED_DAC0_IN_PER_S) * double(dac) / 63.0;
+	return attotime::from_double(1.0 / (inches_per_second * WHEEL_PULSES_PER_INCH));
+}
+
+void hero1_state::update_drive_model()
+{
+	// D6 = motor ON/OFF ("Q801 is used as a switch to turn off the motor
+	// when the data at pin 27 is low", H1-TM p. 74 / spec §1.3). While ON
+	// the wheel turns and the encoder disc produces one pulse per slot;
+	// the first slot after starting from rest arrives one period out.
+	// When OFF the model stops emitting immediately (no coast tail —
+	// approximation ledger A5, documented model choice).
+	const bool motor_on = BIT(m_manual_port_out[5], 6);
+	if (!motor_on)
+	{
+		m_wheel_timer->adjust(attotime::never);
+		m_wheel_pulse_pending = false;
+	}
+	else if (!m_wheel_pulse_pending)
+	{
+		m_wheel_timer->adjust(wheel_pulse_period());
+		m_wheel_pulse_pending = true;
+	}
+}
+
+TIMER_CALLBACK_MEMBER(hero1_state::wheel_pulse_tick)
+{
+	// One disc slot: optical pickup -> Schmitt U324A -> 74221 one-shot
+	// (~7 ms) -> negative edge latches WHEEL DET $40 (spec §1.6/§1.8).
+	// The ROM's $F21C handler counts these down to terminate drive moves
+	// and advances both odometers ($0007/$0009) — completion is entirely
+	// pulse-driven (spec §2.5/§2.7).
+	m_wheel_pulses++;
+	m_wheel_pulses_out = m_wheel_pulses;
+	m_wheel_pulse_pending = false;
+	latch_interrupt(0x40);
+	update_drive_model();
 }
 
 void hero1_state::axis_step(int axis, int direction)
