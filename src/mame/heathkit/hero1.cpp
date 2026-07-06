@@ -140,8 +140,7 @@ private:
 	void speech_request_w(int state);
 	void set_speech_data(u8 data);
 	void latch_speech_phoneme(bool ignore_power = false);
-	void set_interrupt_pending(u8 mask, bool pending);
-	void reassert_level_interrupts();
+	void latch_interrupt(u8 mask);
 	bool drive_feedback_active() const;
 	bool arm_feedback_active() const;
 	void update_irq_line();
@@ -211,12 +210,12 @@ private:
 	u8 m_manual_port_out[8]{};
 	u8 m_debug_io_port_a = 0;
 	u8 m_debug_io_port_b = 0;
-	u8 m_interrupt_status = 0xff;
+	u8 m_interrupt_status = 0x00;
+	u8 m_interrupt_clear_latch = 0xff;
 	u8 m_clock_address = 0;
 	u8 m_clock_control = 0;
 	u8 m_pendant_port = 0x8e;  // ET-18 teaching pendant read byte at $C280; idle ARM/N/released
 	u8 m_experimental_serial_rxd = 1;
-	u8 m_drive_feedback_sample = 0;
 	bool m_driver_trace = false;
 	emu_timer *m_executive_timer = nullptr;
 	emu_timer *m_sonar_timer = nullptr;
@@ -271,11 +270,11 @@ void hero1_state::machine_start()
 	save_item(NAME(m_debug_io_port_a));
 	save_item(NAME(m_debug_io_port_b));
 	save_item(NAME(m_interrupt_status));
+	save_item(NAME(m_interrupt_clear_latch));
 	save_item(NAME(m_clock_address));
 	save_item(NAME(m_clock_control));
 	save_item(NAME(m_pendant_port));
 	save_item(NAME(m_experimental_serial_rxd));
-	save_item(NAME(m_drive_feedback_sample));
 
 	m_executive_timer = timer_alloc(FUNC(hero1_state::executive_timer_tick), this);
 	m_sonar_timer = timer_alloc(FUNC(hero1_state::sonar_echo_tick), this);
@@ -301,12 +300,18 @@ void hero1_state::machine_reset()
 	m_debug_speech_data = 0;
 	m_debug_speech_control = 0;
 	m_tape_in = 1;
+	// Interrupt status register (H1-SCH2, hero-1-motion-spec.md §1.8): the
+	// LS73 flip-flops and the U411 74LS374 clear latch have no reset pins,
+	// so their power-on state is electrically undefined. Deterministic
+	// model choice: no source pending, all clears released — the ROM's own
+	// reset path parks the clear latch at $FF within its first milliseconds
+	// ($F3D2: C6 FF F7 C2 00 F7 0F 04) and dispatches nothing before that.
 	m_interrupt_status = 0x00;
+	m_interrupt_clear_latch = 0xff;
 	m_clock_address = 0;
 	m_clock_control = 0;
 	m_pendant_port = 0x8e;
 	m_experimental_serial_rxd = 1;
-	m_drive_feedback_sample = 0;
 	m_rs232->write_txd(1);
 	m_speech_phoneme = 0;
 	driver_tracef("machine_reset pendant=$%02X speech_request=%u speech_power=%u", m_pendant_port, m_speech_request, m_speech_power);
@@ -496,21 +501,13 @@ u8 hero1_state::sensor_r(offs_t offset)
 
 u8 hero1_state::port_c200_interrupt_r()
 {
-	// CPU-board input buffer U412 exposes the ROM-visible interrupt-status
-	// byte. The monitor handler at $EFC9 treats a set bit as a pending source;
-	// output latch U411 clears selected source bits when written high.
-	u8 feedback = m_motion_detected ? 0x02 : 0x00;
-	if (drive_feedback_active())
-	{
-		m_drive_feedback_sample ^= 1;
-		if (m_drive_feedback_sample)
-			feedback |= 0x02;
-	}
-	else
-	{
-		m_drive_feedback_sample = 0;
-	}
-	return m_interrupt_status | feedback;
+	// Interrupt status register (H1-SCH2; hero-1-motion-spec.md §1.8):
+	// eight 74LS73 J-K flip-flops latch their sources on a negative-going
+	// clock edge; the Q outputs read back through buffer U412. Reads are
+	// non-destructive and report only genuinely latched events — no source
+	// is fabricated here (the old stub's $02 motion-detect toggle during
+	// drive activity was firmware-visible fakery; spec §4 items 2/3).
+	return m_interrupt_status;
 }
 
 u8 hero1_state::port_c220_sonar_r()
@@ -560,8 +557,11 @@ void hero1_state::sensor_w(offs_t offset, u8 data)
 	switch (offset & 0x0f)
 	{
 	case 0x00:
+		// Debug-aperture echo event: a new counter byte models "an echo
+		// arrived with this reading", which is exactly what clocks the
+		// SONAR flip-flop ($01) on hardware (U323B -> U408A, spec §1.8).
 		m_sonar_count = data;
-		set_interrupt_pending(0x01, true);
+		latch_interrupt(0x01);
 		break;
 	case 0x01:
 		m_light_level = data;
@@ -570,10 +570,17 @@ void hero1_state::sensor_w(offs_t offset, u8 data)
 		m_sound_level = data;
 		break;
 	case 0x03:
-		m_motion_detected = data ? 1 : 0;
+	{
+		// MOTION DET. (U408B) is edge-clocked like every other source:
+		// one latched event per detector off->on transition. Deasserting
+		// the aperture never clears the flip-flop — only U411 does.
+		const u8 detected = data ? 1 : 0;
+		if (detected && !m_motion_detected)
+			latch_interrupt(0x02);
+		m_motion_detected = detected;
 		m_motion = m_motion_detected;
-		reassert_level_interrupts();
 		break;
+	}
 	case 0x04:
 	case 0x05:
 	case 0x06:
@@ -609,10 +616,17 @@ void hero1_state::port_c200_control_w(u8 data)
 	m_manual_port_out[0] = data;
 	m_port_outputs[0] = data;
 	driver_tracef("port_c200_control_w data=$%02X interrupt_before=$%02X", data, m_interrupt_status);
-	// CPU-board output latch U411 clears selected interrupt-status flip-flops
-	// when a bit is written high.
-	m_interrupt_status &= ~data;
-	reassert_level_interrupts();
+	// U411 is a 74LS374 LEVEL latch wired to the LS73 active-low clear
+	// pins: a bit written 0 clears that source's flip-flop and HOLDS it
+	// cleared (events on a held-low line are dropped); a bit written 1
+	// releases the clear so the next source edge can latch again. The
+	// ROM's own idiom is a pulse-clear — write (~status & $0F04), then
+	// $0F04 (v1.3 IRQ epilogue) — and its reset path parks $FF. H1-TM
+	// p. 80's "write a '1' ... can selectively clear" prose is a recorded
+	// manual erratum (hero-1-motion-spec.md §1.8, blessing 2026-07-06).
+	m_interrupt_clear_latch = data;
+	m_interrupt_status &= data;
+	update_irq_line();
 }
 
 void hero1_state::port_c220_experimental_w(u8 data)
@@ -637,7 +651,6 @@ void hero1_state::port_c260_motion_w(u8 data)
 {
 	m_manual_port_out[3] = data;
 	m_port_outputs[3] = data;
-	reassert_level_interrupts();
 }
 
 void hero1_state::port_c280_arm_base_w(u8 data)
@@ -646,7 +659,6 @@ void hero1_state::port_c280_arm_base_w(u8 data)
 	m_port_outputs[4] = data;
 	m_motor_head = (data >> 6) & 0x03;
 	m_motor_arm = data & 0x3f;
-	reassert_level_interrupts();
 }
 
 void hero1_state::port_c2a0_main_drive_w(u8 data)
@@ -658,7 +670,6 @@ void hero1_state::port_c2a0_main_drive_w(u8 data)
 	m_motor_left = left;
 	m_motor_right = right;
 	driver_tracef("port_c2a0_main_drive_w data=$%02X left=%u right=%u", data, left, right);
-	reassert_level_interrupts();
 }
 
 void hero1_state::port_c2c0_select_strobe_w(u8 data)
@@ -675,7 +686,6 @@ void hero1_state::port_c2c0_select_strobe_w(u8 data)
 		driver_tracef("port_c2c0_select_strobe_w data=$%02X clock_address=$%01X strobe=%u previous_strobe=%u pc=$%04X", data, m_clock_address, m_speech_strobe_state, previous_strobe, m_maincpu->pc() & 0xffff);
 	if (!previous_strobe && m_speech_strobe_state)
 		latch_speech_phoneme();
-	reassert_level_interrupts();
 }
 
 void hero1_state::port_c2e0_system_select_w(u8 data)
@@ -695,7 +705,10 @@ void hero1_state::port_c2e0_system_select_w(u8 data)
 	}
 	if (!previous_sonar_power && BIT(data, 1))
 	{
-		m_interrupt_status &= ~0x10;
+		// Powering the sonar starts a ping; the echo event latches $01
+		// when the modeled round trip elapses. Power changes never touch
+		// the interrupt flip-flops themselves (spec §1.8; the old stub's
+		// "&= ~$10" here belonged to its inverted $01/$10 pairing).
 		m_sonar_timer->adjust(attotime::from_ticks(u64(m_sonar_count) * 13500 + 1, 32768 * 45000));
 	}
 	else if (previous_sonar_power && !BIT(data, 1))
@@ -768,19 +781,14 @@ void hero1_state::latch_speech_phoneme(bool ignore_power)
 	m_votrax->write(m_speech_phoneme);
 }
 
-void hero1_state::set_interrupt_pending(u8 mask, bool pending)
+void hero1_state::latch_interrupt(u8 mask)
 {
-	if (pending)
-		m_interrupt_status |= mask;
-	else
-		m_interrupt_status &= ~mask;
-	reassert_level_interrupts();
-}
-
-void hero1_state::reassert_level_interrupts()
-{
-	if (BIT(m_pendant_port, 0))
-		m_interrupt_status |= 0x20;
+	// A source event clocks its LS73 flip-flop; it can only latch while
+	// its U411 clear line is released (bit = 1). Sources held cleared by
+	// a 0 bit in the clear latch drop their events — this is what the
+	// ROM's low-battery self-disable idiom ($0F04 = $F7/$FB) relies on
+	// (hero-1-motion-spec.md §1.8, §2.3).
+	m_interrupt_status |= mask & m_interrupt_clear_latch;
 	update_irq_line();
 }
 
@@ -807,25 +815,31 @@ void hero1_state::update_speech_power()
 
 TIMER_CALLBACK_MEMBER(hero1_state::executive_timer_tick)
 {
-	// The monitor's executive service routine increments RAM $0EFC and keeps
-	// motor/speech background work moving from the 1024 Hz real-time-clock tick.
-	set_interrupt_pending(0x01, true);
-	if (drive_feedback_active())
-		set_interrupt_pending(0x02, true);
-	if (!BIT(m_manual_port_out[7], 1))
-		set_interrupt_pending(0x10, true);
+	// $10 TIME CLOCK is the unconditional 1024 Hz tick derived from the
+	// U315 RTC divider chain (H1-TM printed p. 32: RAM $0EFC "counts at
+	// 1024 Hz"; hero-1-motion-spec.md §1.8/§2.3). It drives the ROM's
+	// motor/speech engine at $F016 and is never gated by sonar power —
+	// the sonar-ready source is $01 only (the old stub had the pairing
+	// inverted; spec §4 item 3).
+	latch_interrupt(0x10);
 }
 
 TIMER_CALLBACK_MEMBER(hero1_state::sonar_echo_tick)
 {
-	set_interrupt_pending(0x01, true);
+	// SONAR (U408A): the range-counter echo latch fires once per ping.
+	latch_interrupt(0x01);
 }
 
 void hero1_state::update_pendant_port(u8 data)
 {
+	// TRIGGER (U409B) clocks on the pendant trigger press edge; releasing
+	// the trigger does not clear the flip-flop — only the U411 clear
+	// latch does (hero-1-motion-spec.md §1.8).
+	const bool was_pressed = BIT(m_pendant_port, 0);
 	m_pendant_port = data;
 	const bool trigger_pressed = BIT(m_pendant_port, 0);
-	set_interrupt_pending(0x20, trigger_pressed);
+	if (trigger_pressed && !was_pressed)
+		latch_interrupt(0x20);
 }
 
 void hero1_state::set_pendant_function(bool arm)
