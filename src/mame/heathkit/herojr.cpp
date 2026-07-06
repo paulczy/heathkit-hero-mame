@@ -796,13 +796,16 @@ void herojr_state::mem_map(address_map &map)
 	// HERO Jr Technical Manual address decoder table:
 	// $D810-$D81F selects U213 real-time clock.
 	// $D820-$D83F selects U214, $D840-$D85F selects U215.
-	// $D880-$DFFF selects optional RS-232 adapter U216.
+	// $D880-$DFFF selects optional RS-232 adapter U216 (the manual's
+	// coarse table; the chip's own qualification is CS0 = A7 with
+	// RS = A0 — see rs232_r).
 	// The byte handlers below follow the manual's port labels directly:
 	// $D840 carries SC-01 phoneme/pitch data and the data LEDs, $D841 carries
 	// speech/sense control plus the serial ADC return bit, $D842 CA2/CA1
 	// carries speech strobe/request, $D843 carries the U215 CB1 sonar echo
 	// status, and the HERO Jr ROM treats $D880/$D881 as serial status/control
-	// and data.
+	// and data ($03 master reset + $09 = /16, 7E1, no IRQs — the only
+	// control bytes the shipped firmware ever writes, ROM $FBCF/$FBD4/$FC33).
 	map(0xd810, 0xd81f).rw(FUNC(herojr_state::rtc_r), FUNC(herojr_state::rtc_w));
 	map(0xd820, 0xd820).rw(FUNC(herojr_state::u214_port_a_r), FUNC(herojr_state::u214_port_a_w));
 	map(0xd821, 0xd821).rw(FUNC(herojr_state::u214_port_b_r), FUNC(herojr_state::u214_port_b_w));
@@ -1381,6 +1384,20 @@ void herojr_state::u215_sonar_echo_w(u8 data)
 
 u8 herojr_state::rs232_r(offs_t offset)
 {
+	// U216 chip selects (JR-SCH CPU board sheet 3, read visually
+	// 2026-07-06, G1J-11 hardening): CS2* = the U202 pin-19 $D800-$DFFF
+	// region select, CS0 = A7, CS1 = the RST net, RS = A0. A1-A3, A5,
+	// A6, and A8-A10 are not wired to U216, so the ACIA answers every
+	// region address with A7 = 1 (A0 alone selects the register —
+	// $D882/$D883, $D980/$D981, $DF80/$DF81 are true mirrors) and
+	// nothing with A7 = 0: those addresses select no device here (reads
+	// return the bus constant, writes are ignored — the "absent select
+	// drives no device" convention). Concurrent PIA/RTC selects at
+	// A7 = 1 with A4/A5/A6 = 1 stay unmodeled bus conflicts; the v1.6
+	// ROM and the BASIC cart never generate one (rtc-spec §1.2 census).
+	if (!BIT(offset + 0x80, 7))
+		return 0x00;
+
 	if (BIT(offset, 0))
 		return m_acia->data_r();
 
@@ -1391,6 +1408,10 @@ u8 herojr_state::rs232_r(offs_t offset)
 
 void herojr_state::rs232_w(offs_t offset, u8 data)
 {
+	// CS0 = A7 (see rs232_r): A7 = 0 addresses select no device.
+	if (!BIT(offset + 0x80, 7))
+		return;
+
 	driver_tracef("rs232_w offset=$%X data=$%02X target=%s", unsigned(offset & 0x01), data, BIT(offset, 0) ? "data" : "control");
 	if (BIT(offset, 0))
 	{
@@ -1668,20 +1689,39 @@ void herojr_state::herojr(machine_config &config)
 	m_rtc->sqw().set(FUNC(herojr_state::rtc_sqw_w));
 	m_rtc->irq().set(FUNC(herojr_state::rtc_irq_w));
 
+	// U216 MC6850 (RTA-1-3 accessory, G1J-11 hardening 2026-07-06).
+	// IRQ* (pin 7) is on the shared CPU IRQ net with the U214 IRQs
+	// (JR-SCH sheet 3), although the only control byte the shipped
+	// firmware writes ($09, ROM $FBD4/$FC33) never enables an ACIA
+	// interrupt source. CTS* and DCD* (pins 24/23) are strapped to
+	// ground on the board and RTS* (pin 5) is an unconnected stub —
+	// only TXD, RXD, and ground leave the board on the 3-wire P203
+	// cable (JR-TM printed p. 24; JR-RS install manual pp. 5-7) — so
+	// no modem-control line is routed to or from the socket peer here;
+	// the MAME acia6850 powers up with CTS/DCD asserted, matching the
+	// straps.
 	ACIA6850(config, m_acia, 0);
 	m_acia->irq_handler().set(FUNC(herojr_state::acia_irq_w));
 	m_acia->txd_handler().set(m_rs232, FUNC(rs232_port_device::write_txd));
-	m_acia->rts_handler().set(m_rs232, FUNC(rs232_port_device::write_rts));
 
-	clock_device &acia_clock(CLOCK(config, "acia_clock", 153600));
+	// TXCLK and RXCLK (pins 4/3) are tied together to the SW201 jumper
+	// tap. Baud chain (JR-TM printed p. 24: U217/U212C/U218 "divide the
+	// 1 MHz signal produced by the CPU clock"; JR-SCH sheet 3 read
+	// visually): U217 74LS161 loads 3 (A=B=Vcc, C=D=gnd, LD* from the
+	// U212C NAND of RCO) -> modulo-13 from the 1 MHz E. The SW201
+	// "9600" position taps U217 QC = 2/13 MHz = 153,846 Hz, giving
+	// 9615.4 baud through the ROM's /16 control mode — every screened
+	// SW201 rate runs +0.16% of nominal (13 x 16 = 208 does not divide
+	// 10^6). QC's irregular duty (4/4/5 us intervals) is modeled as a
+	// uniform clock: firmware-invisible through the 6850's /16 edge
+	// counter. Only the 9600 position is modeled (tech-debt item 10).
+	clock_device &acia_clock(CLOCK(config, "acia_clock", 4_MHz_XTAL / 26));
 	acia_clock.signal_handler().set(m_acia, FUNC(acia6850_device::write_txc));
 	acia_clock.signal_handler().append(m_acia, FUNC(acia6850_device::write_rxc));
 
 	RS232_PORT(config, m_rs232, default_rs232_devices, "terminal");
 	m_rs232->set_option_device_input_defaults("null_modem", DEVICE_INPUT_DEFAULTS_NAME(herojr_rs232));
 	m_rs232->rxd_handler().set(m_acia, FUNC(acia6850_device::write_rxd));
-	m_rs232->cts_handler().set(m_acia, FUNC(acia6850_device::write_cts));
-	m_rs232->dsr_handler().set(m_acia, FUNC(acia6850_device::write_dcd));
 
 	SPEAKER(config, "mono").front_center();
 
