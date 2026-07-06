@@ -1210,10 +1210,20 @@ local function get_io_state()
       keypad = pressed,
       pendant = sensor_state.pendant,
       motors = {
-        left = output_value(motor_prefix .. "left"),
-        right = output_value(motor_prefix .. "right"),
-        head = output_value(motor_prefix .. "head"),
-        arm = output_value(motor_prefix .. "arm"),
+        -- Modeled mechanical positions in microsteps (driver outputs
+        -- hero1_axis_position_0..6; order = ROM position bytes
+        -- $0000-$0006: extend, shoulder, rotate, pivot, gripper, head,
+        -- steering — hero-1-motion-spec.md §2.2/§4 P5).
+        axisPositions = {
+          indexed_output_value(prefix .. "_axis_position_", 0),
+          indexed_output_value(prefix .. "_axis_position_", 1),
+          indexed_output_value(prefix .. "_axis_position_", 2),
+          indexed_output_value(prefix .. "_axis_position_", 3),
+          indexed_output_value(prefix .. "_axis_position_", 4),
+          indexed_output_value(prefix .. "_axis_position_", 5),
+          indexed_output_value(prefix .. "_axis_position_", 6)
+        },
+        wheelPulses = output_value(prefix .. "_wheel_pulses"),
         steeringPivotRotate = steering_pivot_rotate,
         steeringPattern = (steering_pivot_rotate >> 4) & 0x0f,
         pivotRotatePattern = steering_pivot_rotate & 0x0f,
