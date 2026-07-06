@@ -37,6 +37,7 @@
 #include "osdcore.h"
 #include "speaker.h"
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
@@ -72,10 +73,7 @@ public:
 		m_key_columns(*this, "KEYCOL%u", 0U),
 		m_basic_baud(*this, "BASIC_BAUD"),
 		m_digits(*this, "hero1_led_digit_%u", 0U),
-		m_motor_left(*this, "hero1_motor_left"),
-		m_motor_right(*this, "hero1_motor_right"),
-		m_motor_head(*this, "hero1_motor_head"),
-		m_motor_arm(*this, "hero1_motor_arm"),
+		m_axis_positions(*this, "hero1_axis_position_%u", 0U),
 		m_speech_phoneme(*this, "hero1_speech_phoneme"),
 		m_speech_inflection(*this, "hero1_speech_inflection"),
 		m_speech_strobe(*this, "hero1_speech_strobe"),
@@ -100,6 +98,75 @@ private:
 	static constexpr u16 HERO1_SENSOR_BASE = 0xd100;   // debug bridge aperture, not original hardware
 	static constexpr u16 HERO1_DEBUG_SPEECH_BASE = 0xd020;
 	static constexpr u16 HERO1_ROM_BASE = 0xe000;
+
+	// ------------------------------------------------------------------
+	// Motion model — hero-1-motion-spec.md (BLESSED 2026-07-06), §4
+	// PROPOSAL P1/P2: the seven stepper axes are phase-followers over the
+	// pattern-select nibbles, positions are modeled mechanical microsteps,
+	// and the six limit switches derive from position, never from
+	// activity.
+	// ------------------------------------------------------------------
+
+	// Axis order matches the ROM position bytes $0000-$0006 and the
+	// per-motor parameter table at $E29F (spec §2.2/§2.6).
+	enum : int
+	{
+		AXIS_EXTEND = 0,
+		AXIS_SHOULDER,
+		AXIS_ROTATE,
+		AXIS_PIVOT,
+		AXIS_GRIPPER,
+		AXIS_HEAD,
+		AXIS_STEERING,
+		AXIS_COUNT
+	};
+
+	// One entry per 4-line pattern-select circuit (spec §1.2/§1.4/§1.5):
+	// steering ($C260 D7-D4, active-low couplers), pattern 1 = wrist
+	// rotate/pivot ($C260 D3-D0), pattern 3 = extend/head ($C280 D7-D4),
+	// pattern 2 = gripper/shoulder ($C280 D3-D0) — arm patterns active-high.
+	enum : int
+	{
+		PGROUP_STEERING = 0,
+		PGROUP_PIVOT_ROTATE,
+		PGROUP_EXTEND_HEAD,
+		PGROUP_GRIP_SHOULDER,
+		PGROUP_COUNT
+	};
+
+	struct axis_config
+	{
+		const char *name;
+		int group;
+		u8 supply_mask;   // $C2C0 bit feeding this motor's +12 V common (spec §1.5); 0 = hard-fed (steering, §1.4)
+		s32 span;         // mechanical travel in microsteps = ROM range x microstep divider (spec §2.6 table; H1-TM p. 32 ranges)
+		s32 initial;      // initialized pose the ROM's cold seeds assume ($FEE7: rotate $4D, head $62, steering $49; spec §2.6)
+	};
+
+	static constexpr axis_config AXES[AXIS_COUNT] = {
+		{ "extend",   PGROUP_EXTEND_HEAD,   0x40, 0x98 * 32, 0 },
+		{ "shoulder", PGROUP_GRIP_SHOULDER, 0x80, 0x86 * 32, 0 },
+		{ "rotate",   PGROUP_PIVOT_ROTATE,  0x80, 0x93 * 8,  0x4d * 8 },
+		{ "pivot",    PGROUP_PIVOT_ROTATE,  0x40, 0xa5 * 8,  0 },
+		{ "gripper",  PGROUP_GRIP_SHOULDER, 0x40, 0x75 * 4,  0 },
+		{ "head",     PGROUP_EXTEND_HEAD,   0x80, 0xc2 * 32, 0x62 * 32 },
+		{ "steering", PGROUP_STEERING,      0x00, 0x93 * 8,  0x49 * 8 },
+	};
+
+	// Position in the two-phase-on full-step cycle from the ROM's $F19B
+	// table (66 55 99 AA; spec §2.1/§3.1), in position-INCREASING order.
+	// -1 = not a two-phase-on pattern.
+	static int phase_index(u8 nibble)
+	{
+		switch (nibble & 0x0f)
+		{
+		case 0x6: return 0;
+		case 0x5: return 1;
+		case 0x9: return 2;
+		case 0xa: return 3;
+		default: return -1;
+		}
+	}
 
 	void mem_map(address_map &map) ATTR_COLD;
 
@@ -141,8 +208,11 @@ private:
 	void set_speech_data(u8 data);
 	void latch_speech_phoneme(bool ignore_power = false);
 	void latch_interrupt(u8 mask);
-	bool drive_feedback_active() const;
-	bool arm_feedback_active() const;
+	void group_pattern_w(int group, u8 pattern);
+	bool axis_supplied(int axis) const;
+	void axis_apply_pattern(int axis, u8 pattern);
+	void axis_energize(int axis);
+	void axis_step(int axis, int direction);
 	void update_irq_line();
 	void update_pendant_port(u8 data);
 	void set_pendant_function(bool arm);
@@ -179,10 +249,7 @@ private:
 	required_ioport m_basic_baud;
 
 	output_finder<6> m_digits;
-	output_finder<> m_motor_left;
-	output_finder<> m_motor_right;
-	output_finder<> m_motor_head;
-	output_finder<> m_motor_arm;
+	output_finder<AXIS_COUNT> m_axis_positions;
 	output_finder<> m_speech_phoneme;
 	output_finder<> m_speech_inflection;
 	output_finder<> m_speech_strobe;
@@ -212,6 +279,9 @@ private:
 	u8 m_debug_io_port_b = 0;
 	u8 m_interrupt_status = 0x00;
 	u8 m_interrupt_clear_latch = 0xff;
+	s32 m_axis_pos[AXIS_COUNT]{};      // modeled mechanical microsteps (0..span); board state, survives reset
+	u8 m_axis_pattern[AXIS_COUNT]{};   // detent pattern the rotor last followed (0 = no memory)
+	u8 m_group_pattern[PGROUP_COUNT]{}; // currently energized nibble per pattern circuit (0 = off)
 	u8 m_clock_address = 0;
 	u8 m_clock_control = 0;
 	u8 m_pendant_port = 0x8e;  // ET-18 teaching pendant read byte at $C280; idle ARM/N/released
@@ -238,10 +308,7 @@ void hero1_state::machine_start()
 	update_cpu_clock();
 
 	m_digits.resolve();
-	m_motor_left.resolve();
-	m_motor_right.resolve();
-	m_motor_head.resolve();
-	m_motor_arm.resolve();
+	m_axis_positions.resolve();
 	m_speech_phoneme.resolve();
 	m_speech_inflection.resolve();
 	m_speech_strobe.resolve();
@@ -271,10 +338,27 @@ void hero1_state::machine_start()
 	save_item(NAME(m_debug_io_port_b));
 	save_item(NAME(m_interrupt_status));
 	save_item(NAME(m_interrupt_clear_latch));
+	save_item(NAME(m_axis_pos));
+	save_item(NAME(m_axis_pattern));
+	save_item(NAME(m_group_pattern));
 	save_item(NAME(m_clock_address));
 	save_item(NAME(m_clock_control));
 	save_item(NAME(m_pendant_port));
 	save_item(NAME(m_experimental_serial_rxd));
+
+	// Mechanical pose is board state, not reset state (Jr steering
+	// precedent): seed the initialized pose the ROM's cold-boot path
+	// assumes — $FEE7 seeds rotate $4D, head $62, steering $49, others 0
+	// (spec §2.6 "Cold-boot seeds") — so the position bytes the ROM
+	// writes agree with the modeled mechanics until the user runs Zero.
+	for (int axis = 0; axis < AXIS_COUNT; axis++)
+	{
+		m_axis_pos[axis] = AXES[axis].initial;
+		m_axis_pattern[axis] = 0;
+		m_axis_positions[axis] = u32(m_axis_pos[axis]);
+	}
+	for (u8 &pattern : m_group_pattern)
+		pattern = 0;
 
 	m_executive_timer = timer_alloc(FUNC(hero1_state::executive_timer_tick), this);
 	m_sonar_timer = timer_alloc(FUNC(hero1_state::sonar_echo_tick), this);
@@ -321,6 +405,16 @@ void hero1_state::machine_reset()
 	update_speech_power();
 	for (u8 &port : m_manual_port_out)
 		port = 0;
+	// The output latches were just cleared: with $C260 = $00 the
+	// active-low steering couplers all conduct (an invalid non-two-phase
+	// pattern — indeterminate torque, no modeled motion) and the
+	// active-high arm patterns are all off. Positions and detent memory
+	// are mechanical state and deliberately NOT reset; the ROM's own
+	// quiesce ($F3AB) parks the latches within milliseconds.
+	group_pattern_w(PGROUP_STEERING, 0x0f);
+	group_pattern_w(PGROUP_PIVOT_ROTATE, 0x00);
+	group_pattern_w(PGROUP_EXTEND_HEAD, 0x00);
+	group_pattern_w(PGROUP_GRIP_SHOULDER, 0x00);
 	m_debug_io_port_a = 0;
 	m_debug_io_port_b = 0;
 	for (int port = 0; port < 8; port++)
@@ -528,12 +622,29 @@ u8 hero1_state::port_c240_sense_r()
 
 u8 hero1_state::port_c260_limits_speech_r()
 {
-	// Bit 7 is documented as TAPE IN and bit 0 as Speech Request. The
-	// remaining feedback lines are modeled as active-low completion inputs so
-	// ROM, BASIC, and debugger-loaded programs do not wait forever for motion.
-	u8 value = 0x7e | (m_tape_in ? 0x80 : 0x00) | (m_speech_request ? 0x01 : 0x00);
-	if (arm_feedback_active() || drive_feedback_active())
-		value &= ~0x48;
+	// Input port U302 (74LS244, non-inverting): D7 TAPE IN, D0 SPEECH
+	// REQUEST, and the six limit-switch lines — ACTIVE LOW through 10 k
+	// pullups; a switch closes to ground exactly at its axis's travel end
+	// (hero-1-motion-spec.md §1.7). The adjudicated bit map (H1-IC block
+	// labels, corroborated by ROM homing, TM p. 32, and H1-UG): D6/D5/D4 =
+	// the position-0 ends (steering left, shoulder down, head CCW),
+	// D3/D2/D1 = the maxima (right, up, CW). Limits derive from modeled
+	// POSITION only — never asserted in pairs, never mid-travel, and motor
+	// latch activity does not touch them (the stub's $48 "feedback" fake
+	// is retired; spec §4 item 1: no phantom limits).
+	u8 value = (m_tape_in ? 0x80 : 0x00) | (m_speech_request ? 0x01 : 0x00);
+	if (m_axis_pos[AXIS_STEERING] > 0)
+		value |= 0x40;
+	if (m_axis_pos[AXIS_SHOULDER] > 0)
+		value |= 0x20;
+	if (m_axis_pos[AXIS_HEAD] > 0)
+		value |= 0x10;
+	if (m_axis_pos[AXIS_STEERING] < AXES[AXIS_STEERING].span)
+		value |= 0x08;
+	if (m_axis_pos[AXIS_SHOULDER] < AXES[AXIS_SHOULDER].span)
+		value |= 0x04;
+	if (m_axis_pos[AXIS_HEAD] < AXES[AXIS_HEAD].span)
+		value |= 0x02;
 	return value;
 }
 
@@ -651,31 +762,57 @@ void hero1_state::port_c260_motion_w(u8 data)
 {
 	m_manual_port_out[3] = data;
 	m_port_outputs[3] = data;
+	// High nibble drives the steering couplers ACTIVE-LOW (U806-U809 /
+	// Q804-Q807; the ROM's port writer $F171 complements exactly this
+	// nibble — spec §1.4/§2.4/§3.1), so undo the inversion to recover the
+	// energized-winding pattern. Low nibble is arm pattern circuit 1
+	// (wrist rotate + wrist pivot), ACTIVE-HIGH (spec §1.5).
+	group_pattern_w(PGROUP_STEERING, (~data >> 4) & 0x0f);
+	group_pattern_w(PGROUP_PIVOT_ROTATE, data & 0x0f);
 }
 
 void hero1_state::port_c280_arm_base_w(u8 data)
 {
 	m_manual_port_out[4] = data;
 	m_port_outputs[4] = data;
-	m_motor_head = (data >> 6) & 0x03;
-	m_motor_arm = data & 0x3f;
+	// D7-D4 = extend/head pattern (arm pattern circuit 3), D3-D0 =
+	// gripper/shoulder pattern (circuit 2), both ACTIVE-HIGH; which motor
+	// of each pair moves is decided by the $C2C0 supply selects (spec
+	// §1.2/§1.5 — the old "head = bits 7-6, arm = bits 5-0" split was a
+	// misdecode, spec §4 item 5).
+	group_pattern_w(PGROUP_EXTEND_HEAD, (data >> 4) & 0x0f);
+	group_pattern_w(PGROUP_GRIP_SHOULDER, data & 0x0f);
 }
 
 void hero1_state::port_c2a0_main_drive_w(u8 data)
 {
+	// U307 main-drive latch: D7 direction relay K801, D6 motor ON/OFF,
+	// D5-D0 speed DAC (spec §1.2/§1.3). The machine has ONE drive motor —
+	// the old left/right decode was a misdecode (spec §4 item 4).
 	m_manual_port_out[5] = data;
 	m_port_outputs[5] = data;
-	const u8 left = BIT(data, 0) ? 1 : 0;
-	const u8 right = BIT(data, 1) ? 1 : 0;
-	m_motor_left = left;
-	m_motor_right = right;
-	driver_tracef("port_c2a0_main_drive_w data=$%02X left=%u right=%u", data, left, right);
+	driver_tracef("port_c2a0_main_drive_w data=$%02X direction=%u on=%u dac=%u", data, BIT(data, 7), BIT(data, 6), data & 0x3f);
 }
 
 void hero1_state::port_c2c0_select_strobe_w(u8 data)
 {
+	const u8 previous_supplies = m_manual_port_out[6] & 0xc0;
 	m_manual_port_out[6] = data;
 	m_port_outputs[6] = data;
+	// D7 = arm supply select 1 (+12 V to wrist rotate, shoulder, head),
+	// D6 = supply select 2 (wrist pivot, gripper, extend); active HIGH
+	// (spec §1.5). Energizing a supply re-detents the supplied motors
+	// onto whatever pattern their circuit currently holds — a snap, not
+	// a modeled step. De-energizing frees them (position/detent kept).
+	const u8 rising_supplies = data & ~previous_supplies & 0xc0;
+	if (rising_supplies != 0)
+	{
+		for (int axis = 0; axis < AXIS_COUNT; axis++)
+		{
+			if ((AXES[axis].supply_mask & rising_supplies) != 0)
+				axis_energize(axis);
+		}
+	}
 	m_clock_address = data & 0x0f;
 	m_rtc->address_w(m_clock_address);
 	m_speech_control = data;
@@ -792,15 +929,86 @@ void hero1_state::latch_interrupt(u8 mask)
 	update_irq_line();
 }
 
-bool hero1_state::drive_feedback_active() const
+void hero1_state::group_pattern_w(int group, u8 pattern)
 {
-	const u8 steering_phase = m_manual_port_out[3] & 0xf0;
-	return BIT(m_manual_port_out[5], 6) || (steering_phase != 0x00 && steering_phase != 0xf0);
+	pattern &= 0x0f;
+	if (pattern == m_group_pattern[group])
+		return;
+	m_group_pattern[group] = pattern;
+	for (int axis = 0; axis < AXIS_COUNT; axis++)
+	{
+		if (AXES[axis].group != group)
+			continue;
+		// A motor moves only when its pattern lines cycle AND its +12 V
+		// supply is energized (spec §1.5); steering is hard-fed (§1.4).
+		if (!axis_supplied(axis))
+			continue;
+		axis_apply_pattern(axis, pattern);
+	}
 }
 
-bool hero1_state::arm_feedback_active() const
+bool hero1_state::axis_supplied(int axis) const
 {
-	return m_manual_port_out[4] != 0 || (m_manual_port_out[3] & 0x0f) != 0 || (m_manual_port_out[6] & 0xc0) != 0;
+	const u8 mask = AXES[axis].supply_mask;
+	return mask == 0 || (m_manual_port_out[6] & mask) != 0;
+}
+
+void hero1_state::axis_apply_pattern(int axis, u8 pattern)
+{
+	// De-energized at rest (the ROM writes pattern 0 when a move
+	// completes, spec §2.4 step 1): the rotor holds its last detent, so
+	// keep the pattern memory and model no motion.
+	if (pattern == 0)
+		return;
+
+	const int to = phase_index(pattern);
+	if (to < 0)
+	{
+		// Not a two-phase-on pattern: torque is indeterminate, model no
+		// motion and forget the detent memory (approximation ledger A4).
+		m_axis_pattern[axis] = 0;
+		return;
+	}
+
+	const int from = phase_index(m_axis_pattern[axis]);
+	if (from >= 0)
+	{
+		// Adjacent pattern transitions move exactly one full step in the
+		// $F19B cycle's direction (spec §2.1/§3.1). The same pattern, an
+		// opposite (distance-2) pattern, or re-energizing after rest
+		// moves the model at most re-detent-distance zero — the ROM's
+		// move-start phase reset can jump up to two full steps and the
+		// physical outcome is load-dependent; the model absorbs it as no
+		// motion (spec §2.4 note + approximation A4).
+		const int delta = (to - from) & 3;
+		if (delta == 1)
+			axis_step(axis, 1);
+		else if (delta == 3)
+			axis_step(axis, -1);
+	}
+	m_axis_pattern[axis] = pattern;
+}
+
+void hero1_state::axis_energize(int axis)
+{
+	const u8 pattern = m_group_pattern[AXES[axis].group];
+	m_axis_pattern[axis] = (phase_index(pattern) >= 0) ? pattern : 0;
+}
+
+void hero1_state::axis_step(int axis, int direction)
+{
+	// Clamp at the mechanical ends: unswitched axes stall harmlessly
+	// against their stops while the ROM's RAM count keeps running —
+	// exactly the Heath open-loop home (spec §2.6 Zero, approximation
+	// A3); switched axes close their limit switches at these same ends
+	// (§1.7), which the $C260 read derives from this position.
+	const s32 stepped = m_axis_pos[axis] + direction;
+	const s32 clamped = std::clamp(stepped, s32(0), AXES[axis].span);
+	if (clamped != m_axis_pos[axis])
+	{
+		m_axis_pos[axis] = clamped;
+		m_axis_positions[axis] = u32(clamped);
+	}
 }
 
 void hero1_state::update_irq_line()
