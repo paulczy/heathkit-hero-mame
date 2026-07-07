@@ -1396,9 +1396,11 @@ local function broadcast_io_changed(force)
   end
 end
 
--- Dedicated byte-exact phoneme stream (Phase 2.2d, G1J-07/G2J-09/G2J-01):
--- the driver publishes a latch sequence counter, the latched byte, its
--- emulated-time stamp, and a cumulative clip counter (latch-while-busy).
+-- Dedicated byte-exact phoneme stream (Phase 2.2d, G1J-07/G2J-09/G2J-01;
+-- the hero1 driver publishes the same `<prefix>_phoneme_*` contract since
+-- Phase 4.3): the driver publishes a latch sequence counter, the latched
+-- byte, its emulated-time stamp, and a cumulative clip counter
+-- (latch-while-busy).
 -- io_changed's whole-state dedup and 50 ms rate limit cannot be byte-exact,
 -- so every sequence advance is emitted as its own `phoneme` event. The
 -- shortest SC-01 phoneme (47 ms per the Programmer's Guide chart) outlasts

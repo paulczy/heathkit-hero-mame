@@ -83,6 +83,10 @@ public:
 		m_speech_inflection(*this, "hero1_speech_inflection"),
 		m_speech_strobe(*this, "hero1_speech_strobe"),
 		m_speech_ready(*this, "hero1_speech_ready"),
+		m_phoneme_seq(*this, "hero1_phoneme_seq"),
+		m_phoneme_byte(*this, "hero1_phoneme_byte"),
+		m_phoneme_time_us(*this, "hero1_phoneme_time_us"),
+		m_phoneme_clips(*this, "hero1_phoneme_clips"),
 		m_motion(*this, "hero1_motion_detected"),
 		m_port_outputs(*this, "hero1_port_out_%u", 0U)
 	{
@@ -285,6 +289,20 @@ private:
 	output_finder<> m_speech_inflection;
 	output_finder<> m_speech_strobe;
 	output_finder<> m_speech_ready;
+	// Passive SC-01 latch telemetry (HERO Jr contract parity): latch
+	// sequence counter, latched byte, emulated-time stamp, and clip
+	// counter (latch-while-busy events), published for the bridge's
+	// byte-exact `phoneme` events.
+	output_finder<> m_phoneme_seq;
+	output_finder<> m_phoneme_byte;
+	output_finder<> m_phoneme_time_us;
+	output_finder<> m_phoneme_clips;
+
+	static s32 emulated_time_us(const attotime &now)
+	{
+		return s32(u64(now.as_double() * 1e6) & 0x7fffffff);
+	}
+
 	output_finder<> m_motion;
 	output_finder<8> m_port_outputs;
 
@@ -301,6 +319,8 @@ private:
 	u8 m_speech_power = 0;
 	u8 m_speech_request = 1;
 	u8 m_speech_strobe_state = 0;
+	u32 m_phoneme_seq_count = 0;
+	u32 m_phoneme_clip_count = 0;
 	u8 m_debug_speech_data = 0;
 	u8 m_debug_speech_control = 0;
 	u8 m_tape_in = 1;
@@ -348,6 +368,10 @@ void hero1_state::machine_start()
 	m_speech_inflection.resolve();
 	m_speech_strobe.resolve();
 	m_speech_ready.resolve();
+	m_phoneme_seq.resolve();
+	m_phoneme_byte.resolve();
+	m_phoneme_time_us.resolve();
+	m_phoneme_clips.resolve();
 	m_motion.resolve();
 	m_port_outputs.resolve();
 
@@ -364,6 +388,8 @@ void hero1_state::machine_start()
 	save_item(NAME(m_speech_power));
 	save_item(NAME(m_speech_request));
 	save_item(NAME(m_speech_strobe_state));
+	save_item(NAME(m_phoneme_seq_count));
+	save_item(NAME(m_phoneme_clip_count));
 	save_item(NAME(m_debug_speech_data));
 	save_item(NAME(m_debug_speech_control));
 	save_item(NAME(m_tape_in));
@@ -442,6 +468,14 @@ void hero1_state::machine_reset()
 	m_speech_inflection = 0;
 	m_speech_strobe = 0;
 	m_speech_ready = 1;
+	// Machine reset restarts the phoneme telemetry sequence; the bridge's
+	// per-frame poll treats a counter that moved backwards as a restart.
+	m_phoneme_seq_count = 0;
+	m_phoneme_clip_count = 0;
+	m_phoneme_seq = 0;
+	m_phoneme_byte = 0;
+	m_phoneme_time_us = 0;
+	m_phoneme_clips = 0;
 	update_speech_power();
 	for (u8 &port : m_manual_port_out)
 		port = 0;
@@ -958,6 +992,26 @@ void hero1_state::latch_speech_phoneme(bool ignore_power)
 {
 	if (!ignore_power && !m_speech_power)
 		return;
+
+	// Passive phoneme telemetry (HERO Jr contract parity): every latched
+	// SC-01 byte — the ROM's $F1FA routine writes $C240 then pulses the
+	// $C2C0 bit-5 strobe — is published with a sequence counter and its
+	// emulated-time stamp so the bridge can emit byte-exact `phoneme`
+	// events (io_changed's whole-snapshot dedup and rate limit cannot be
+	// byte-exact). A latch while the previous phoneme is still sounding
+	// (request low) is a clip on real hardware; count it. Unlike the Jr
+	// (R226 keeps its CMOS SC-01 powered), an unpowered $C2E0-bit-3 board
+	// never latches, so telemetry sits after the power gate. Observation
+	// only — the SC-01 write path below is unchanged.
+	if (!m_speech_request)
+	{
+		m_phoneme_clip_count++;
+		m_phoneme_clips = s32(m_phoneme_clip_count & 0x7fffffff);
+	}
+	m_phoneme_seq_count++;
+	m_phoneme_seq = s32(m_phoneme_seq_count & 0x7fffffff);
+	m_phoneme_byte = m_speech_data;
+	m_phoneme_time_us = emulated_time_us(machine().time());
 
 	m_votrax->inflection_w(m_speech_inflection);
 	m_votrax->write(m_speech_phoneme);
