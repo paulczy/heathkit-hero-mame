@@ -2360,6 +2360,28 @@ local function poll()
     end
   end
 
+  -- Post-request replication of the scan's "run" bookkeeping. Requests above
+  -- (continue, step_*, run_for_ms, reset_machine) flip the debugger to run
+  -- AFTER this pump's scan already happened; when requests were serviced
+  -- first, the same pump's run branch did this. Without it, a sub-frame
+  -- gtime window (run_for_ms shorter than the next pump — G1J-09's 5 ms UIP
+  -- landings) expires with pending_step_seen_run still false and a landing
+  -- PC equal to the start PC (tight RTC poll loop), so the runFor stop is
+  -- never broadcast and the auto-resume runs away (gate
+  -- conformance-2026-07-10T16-06-09Z, both G1J-09 subtests). Clearing
+  -- last_stop_pc here likewise keeps a legitimate immediate same-address
+  -- re-stop after a continue detectable, as it was under the old order.
+  -- Safe: the machine executes no instructions inside a pump, so no stop
+  -- console line can appear between the scan above and this point — the
+  -- fast-forward only skips request-generated command echo.
+  if manager.machine.debugger and manager.machine.debugger.execution_state == "run" then
+    if pending_step_reason then
+      pending_step_seen_run = true
+    end
+    last_stop_pc = nil
+    console_log_last = #manager.machine.debugger.consolelog
+  end
+
   broadcast_phoneme_events()
   broadcast_io_changed()
 end
