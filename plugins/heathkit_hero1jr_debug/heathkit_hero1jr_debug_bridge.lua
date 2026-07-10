@@ -2235,41 +2235,22 @@ local function poll()
     emu.print_info(log_prefix() .. ": autostarted HERO ROM monitor at reset vector $" .. string.format("%04X", vector))
   end
 
-  if server then
-    while true do
-      local client = server:accept()
-      if not client then
-        break
-      end
-      client:settimeout(0)
-      if #clients >= 1 then
-        -- G0-04 single-client bridge: the second concurrent client is
-        -- actively refused — an explicit error line, then a deliberate
-        -- close — while the first client stays served.
-        send_response(client, {
-          id = json_null,
-          ok = false,
-          error = "bridge already has an active client; the HERO bridge is single-client"
-        })
-        pcall(function() client:close() end)
-      else
-        -- No greeting event: the protocol's readiness contract is the
-        -- client's own request/response round trip (the old `ready` event
-        -- proved nothing a client could rely on and was deleted).
-        clients[#clients + 1] = client
-      end
-    end
-  end
-
-  -- Reap by identity, never by captured index: a mid-handler broadcast can
-  -- remove entries from `clients` while this loop runs, so a stale index
-  -- would close an innocent client.
-  for _, client in ipairs({ table.unpack(clients) }) do
-    if not poll_client(client) then
-      drop_client(client)
-    end
-  end
-
+  -- Stop detection MUST run before client requests are serviced (G2J-05 P0,
+  -- 2026-07-10, gate conformance-2026-07-09T23-50-08Z). With `-debugger none`
+  -- a stop auto-resumes (none.cpp wait_for_debugger() issues go()), so each
+  -- stop's ONLY detection chance is the single periodic_check pump inside
+  -- debugger_cpu::wait_for_debugger()'s stopped loop. When this function
+  -- serviced requests first, a `continue` already queued on the socket —
+  -- the client answering the PREVIOUS stop, with the two breakpoints only a
+  -- few instructions apart ($9FDD/$9FE7) — flipped execution_state to "run"
+  -- before the scan, and the "run" branch below then discarded the
+  -- printed-but-never-broadcast "Stopped at breakpoint" console line
+  -- (console_log_last fast-forward): the stop was lost permanently.
+  -- Deterministic both ways in conformance/tools/reproG2j05.ts
+  -- (queued-continue scenario): request-first eats a stop 8/8, scan-first
+  -- reports 8/8. Scanning first is safe: within one pump no instructions
+  -- execute, so the scan sees the authoritative pre-request state, and a
+  -- continue serviced afterwards simply resumes the just-broadcast stop.
   if manager.machine.debugger and manager.machine.debugger.execution_state == "stop" then
     if pending_step_reason then
       local addr = get_register("pc")
@@ -2342,6 +2323,41 @@ local function poll()
     end
     last_stop_pc = nil
     console_log_last = #manager.machine.debugger.consolelog
+  end
+
+  if server then
+    while true do
+      local client = server:accept()
+      if not client then
+        break
+      end
+      client:settimeout(0)
+      if #clients >= 1 then
+        -- G0-04 single-client bridge: the second concurrent client is
+        -- actively refused — an explicit error line, then a deliberate
+        -- close — while the first client stays served.
+        send_response(client, {
+          id = json_null,
+          ok = false,
+          error = "bridge already has an active client; the HERO bridge is single-client"
+        })
+        pcall(function() client:close() end)
+      else
+        -- No greeting event: the protocol's readiness contract is the
+        -- client's own request/response round trip (the old `ready` event
+        -- proved nothing a client could rely on and was deleted).
+        clients[#clients + 1] = client
+      end
+    end
+  end
+
+  -- Reap by identity, never by captured index: a mid-handler broadcast can
+  -- remove entries from `clients` while this loop runs, so a stale index
+  -- would close an innocent client.
+  for _, client in ipairs({ table.unpack(clients) }) do
+    if not poll_client(client) then
+      drop_client(client)
+    end
   end
 
   broadcast_phoneme_events()
