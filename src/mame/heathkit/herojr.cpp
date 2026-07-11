@@ -159,6 +159,8 @@ private:
 	u8 u214_port_b_r();
 	void u214_port_a_w(u8 data);
 	void u214_port_b_w(u8 data);
+	u8 u214_port_b_driven() const;
+	void apply_u214_port_b_lines(u8 previous_driven);
 	u8 u214_control_a_r();
 	u8 u214_control_b_r();
 	void u214_control_a_w(u8 data);
@@ -284,7 +286,8 @@ private:
 	// though the $D823 read handler is side-effect-free since the §7.1
 	// remediation (2026-07-05).
 	output_finder<> m_u214_control_b_output;
-	// U214 port B output latch ($D821 low seven bits) for the bridge io
+	// U214 port B driven-line image (ORB ∧ DDRB, low seven bits — the
+	// CPU-visible/physically-driven $D821 state) for the bridge io
 	// snapshot: a $D821 Peripheral Register B read clears the latched wheel
 	// IRQB1 flag (6821 rule, spec §5.1), so the every-frame observer must
 	// compose instead of bus-reading (plugin herojr_d821_snapshot — the
@@ -297,8 +300,14 @@ private:
 	output_finder<> m_ram_top;
 	output_finder<8> m_port_outputs;
 
-	u8 m_u214_port_a = 0xff;
-	u8 m_u214_port_b = 0xff;
+	// U214 register file, real 6821 semantics (R1 remediation, 2026-07-11):
+	// Output Registers A/B, Data Direction Registers A/B, Control Registers
+	// A/B. RESET* clears all six (datasheet); CRA.2/CRB.2 route $D820/$D821
+	// between DDR and Peripheral Register exactly as U215 already models.
+	u8 m_u214_port_a = 0;
+	u8 m_u214_port_b = 0;
+	u8 m_u214_ddr_a = 0;
+	u8 m_u214_ddr_b = 0;
 	u8 m_u214_control_a = 0;
 	u8 m_u214_control_b = 0;
 	u8 m_motion_detector_state = 0;
@@ -458,6 +467,8 @@ void herojr_state::machine_start()
 
 	save_item(NAME(m_u214_port_a));
 	save_item(NAME(m_u214_port_b));
+	save_item(NAME(m_u214_ddr_a));
+	save_item(NAME(m_u214_ddr_b));
 	save_item(NAME(m_u214_control_a));
 	save_item(NAME(m_u214_control_b));
 	save_item(NAME(m_motion_detector_state));
@@ -517,8 +528,15 @@ void herojr_state::reset_interface_state()
 	m_u214->reset();
 	m_u215->reset();
 
-	m_u214_port_a = 0xff;
+	// 6821 RESET* clears all six U214 registers (datasheet). With DDRA = 0
+	// every port A line is an undriven input and idles high through the
+	// port's passive pull-ups, so the matrix still reads released ($FF)
+	// before the ROM's $EB89-$EB95 init — same observable as the old
+	// $FF-latch convenience, now by the real mechanism.
+	m_u214_port_a = 0x00;
 	m_u214_port_b = 0x00;
+	m_u214_ddr_a = 0x00;
+	m_u214_ddr_b = 0x00;
 	m_u214_control_a = 0;
 	m_u214_control_b = 0;
 	m_u214_ca1_flag = 0; // 6821 reset clears the interrupt flags
@@ -886,21 +904,27 @@ void herojr_state::rtc_w(offs_t offset, u8 data)
 
 u8 herojr_state::u214_port_a_r()
 {
+	// CRA bit 2 = 0 routes $D820 to DDRA (6821 register-select rule; the
+	// ROM's only DDR-mode window is its own $EB89-$EB95 init, DDRA = $FF).
+	// A DDR read has NO side effects — in particular it never clears the
+	// latched IRQA1 flag (R1 remediation, 2026-07-11).
+	if (!BIT(m_u214_control_a, 2))
+		return m_u214_ddr_a;
+
 	const u8 data = keypad_matrix_r();
 	// 6821 datasheet: a Peripheral Register A read clears the latched
 	// IRQA1 flag (and releases IRQA*). This is the ONLY clear on real
 	// silicon, and the v1.6 ROM leans on it: the $D17F tick service's
 	// keyboard scan ($D1C5) reads $D820, consuming exactly one RTC SQW
 	// tick per service pass — the 256/s cadence of hero-jr-rtc-spec.md
-	// §2.3. (U214 has no DDR routing model — tech-debt item 7 — so every
-	// read here is a peripheral-register read.) Debugger/UI reads are
-	// guarded, matching the U215 request-flag and sonar-echo clears.
+	// §2.3. Debugger/UI reads are guarded, matching the U215 request-flag
+	// and sonar-echo clears.
 	if (!machine().side_effects_disabled() && m_u214_ca1_flag)
 	{
 		m_u214_ca1_flag = 0;
 		update_irq_line();
 	}
-	driver_tracef("u214_port_a_r data=$%02X port_a=$%02X wheel_cb1_flag=%u", data, m_u214_port_a, m_u214_cb1_flag);
+	driver_tracef("u214_port_a_r data=$%02X port_a=$%02X ddr_a=$%02X wheel_cb1_flag=%u", data, m_u214_port_a, m_u214_ddr_a, m_u214_cb1_flag);
 	return data;
 }
 
@@ -912,7 +936,12 @@ u8 herojr_state::u214_port_a_r()
 // keypress sets; there is no other injection channel.
 u8 herojr_state::keypad_matrix_r()
 {
-	u8 data = m_u214_port_a;
+	// 6821 port A reads return the PINS: a logic-1 output is a passive
+	// pull-up an external contact can pull low (the whole matrix mechanism),
+	// and an input-configured (undriven) line idles high through the same
+	// pull-up. Effective pin level before external pulls is therefore
+	// ORA | ~DDRA (with the ROM's DDRA = $FF this reduces to the latch).
+	u8 data = m_u214_port_a | u8(~m_u214_ddr_a);
 	for (int row = 0; row < 4; row++)
 	{
 		const u8 row_bits = m_keypad_rows[row]->read() & 0x0f;
@@ -936,26 +965,51 @@ u8 herojr_state::keypad_matrix_r()
 
 u8 herojr_state::u214_port_b_r()
 {
+	// CRB bit 2 = 0 routes $D821 to DDRB (6821 register-select rule; the
+	// ROM's only DDR-mode window is its own $EB5C-$EB68 init, DDRB = $3F).
+	// A DDR read has NO side effects — in particular it never clears the
+	// latched IRQB1 wheel flag (R1 remediation, 2026-07-11).
+	if (!BIT(m_u214_control_b, 2))
+		return m_u214_ddr_b;
+
 	// 6821 datasheet: a Peripheral Register B read clears the latched
 	// IRQB1 flag (and releases IRQB*) — here the wheel-encoder CB1 latch
 	// (adc-encoder spec §5.1). This is the ONLY clear on real silicon, and
 	// the v1.6 ROM leans on it: the $D17F IRQ dispatcher's odometer
 	// service ($D19E) ends in exactly this read after counting the pulse
-	// at $05A1:$05A2. (U214 has no DDR routing model — tech-debt item 7 —
-	// so every read here is a peripheral-register read.) Debugger/UI reads
-	// are guarded, matching the U215 sonar-echo and U214 CA1 clears.
+	// at $05A1:$05A2. Debugger/UI reads are guarded, matching the U215
+	// sonar-echo and U214 CA1 clears.
 	if (!machine().side_effects_disabled() && m_u214_cb1_flag)
 	{
 		m_u214_cb1_flag = 0;
 		m_wheel_feedback = 0;
 		update_irq_line();
 	}
-	return (m_u214_port_b & 0x7f) | (m_motion_detector_state ? 0x00 : 0x80);
+	// Port B read composition (6821 datasheet, unlike port A): bits
+	// configured as OUTPUTS return the Output Register; bits configured
+	// as INPUTS return the pins. Input pins here: D7 is the optional IR
+	// motion detector (active-low, JR-TM printed p. 23); D6 and any
+	// drive/steering line left in input mode have no wired SOURCE on the
+	// walked JR-TM/JR-SCH extent (they feed driver-circuit inputs), and a
+	// floating 6821 port B input has no pull-up — modeled as reading low.
+	const u8 pins = m_motion_detector_state ? 0x00 : 0x80;
+	return (m_u214_port_b & m_u214_ddr_b) | (pins & u8(~m_u214_ddr_b));
+}
+
+// Physically driven port B lines: Output Register bits actually driven
+// through DDRB (an undriven line de-energizes its driver stage — the motor
+// enable, direction relay, and steering phases move only when their bits
+// are BOTH latched and configured as outputs). Bit 7 is never a modeled
+// output: the motion-detector input owns the pin and the ROM never
+// configures it as an output.
+u8 herojr_state::u214_port_b_driven() const
+{
+	return m_u214_port_b & m_u214_ddr_b & 0x7f;
 }
 
 bool herojr_state::drive_feedback_active() const
 {
-	return BIT(m_u214_port_b, 1);
+	return BIT(u214_port_b_driven(), 1);
 }
 
 // Limit switches at the mechanical ends of the ROM's own travel coding
@@ -1025,17 +1079,18 @@ void herojr_state::emit_wheel_pulse()
 	m_u214_cb1_flag = 1;
 	m_wheel_feedback = 1;
 	update_irq_line();
-	driver_tracef("emit_wheel_pulse coast_remaining=%u travel_accum=%u port_b=$%02X control_b=$%02X", m_wheel_coast_remaining, m_wheel_travel_accum, m_u214_port_b, m_u214_control_b);
+	driver_tracef("emit_wheel_pulse coast_remaining=%u travel_accum=%u port_b=$%02X ddr_b=$%02X control_b=$%02X", m_wheel_coast_remaining, m_wheel_travel_accum, m_u214_port_b, m_u214_ddr_b, m_u214_control_b);
 
 	// World-model travel rides the same pulse train (spec §7.4 "one speed,
 	// two consumers"): 64 accumulated per pulse, one modeled inch per 146 —
 	// counts × 64⁄146 = inches, the exact inverse of the cart's
 	// counts = n × 146⁄64 arithmetic (spec §5.2/§6) — so the Phase-E drive
 	// check and the odometer agree about how far the robot moved, as on
-	// hardware. The $3F latch image is the U214 DDR-byte transient
-	// (tech-debt item 7), not motion — skip it, as the old model did.
-	if ((m_u214_port_b & 0x3f) == 0x3f)
-		return;
+	// hardware. Every pulse is motion: pulses exist only while the real
+	// drive-enable line (ORB ∧ DDRB bit 1) is up or during the coast tail.
+	// (The old model's $3F special case — suppressing travel while the
+	// DDR-byte transient falsely ran the motors — is retired with the
+	// transient itself, R1 remediation 2026-07-11.)
 	m_wheel_travel_accum += 64;
 	if (m_wheel_travel_accum >= 146)
 	{
@@ -1047,37 +1102,69 @@ void herojr_state::emit_wheel_pulse()
 	}
 }
 
-// Pure output-latch write: every byte updates the scan latch, exactly as
-// the ROM's $D1C5 scan routine expects. (The old write-sniffing heuristic
-// that interpreted certain bit patterns as bridge key injections is gone —
-// keys come only from ioport fields.)
+// $D820 write, CRA-routed like any 6821: CRA.2 = 0 targets DDRA (the ROM's
+// own $EB8E/$EB90 DDRA = $FF is the only DDR-mode write in the image);
+// CRA.2 = 1 is a pure scan-latch update, exactly as the ROM's $D1C5 scan
+// routine expects. (The old write-sniffing heuristic that interpreted
+// certain bit patterns as bridge key injections is gone — keys come only
+// from ioport fields.)
 void herojr_state::u214_port_a_w(u8 data)
 {
+	if (!BIT(m_u214_control_a, 2))
+	{
+		m_u214_ddr_a = data;
+		return;
+	}
 	m_u214_port_a = data;
 }
 
+// $D821 write, CRB-routed like any 6821: CRB.2 = 0 targets DDRB — the
+// ROM's own init writes DDRB = $3F at $EB61/$EB63 inside the $33/$3F/$37
+// sequence, and on real silicon that byte configures pin drivers while the
+// Peripheral Register stays at RESET*'s $00: NOTHING moves. (The old model
+// latched the DDR byte as live output, falsely energizing both drive
+// outputs from PIA init until the diagnostic's first $ED52 motor stop —
+// the R1 sign-off remediation defect, exposed by
+// conformance/tier1/herojr/u214-ddr.test.ts before this fix.) Both
+// register targets converge on apply_u214_port_b_lines: the physical
+// drive/steering lines are ORB ∧ DDRB, so a DDR rewrite that changes the
+// driven image moves the model exactly as re-wiring the pins would.
 void herojr_state::u214_port_b_w(u8 data)
 {
-	const bool was_driving = drive_feedback_active();
-	m_u214_port_b = data & 0x7f;
-	m_u214_port_b_output = m_u214_port_b;
-	update_steering_position(data);
-	if ((m_u214_port_b & 0x3e) != 0)
+	const u8 previous_driven = u214_port_b_driven();
+	if (!BIT(m_u214_control_b, 2))
+	{
+		m_u214_ddr_b = data;
+		driver_tracef("u214_port_b_w ddr data=$%02X port_b=$%02X", data, m_u214_port_b);
+	}
+	else
+	{
+		m_u214_port_b = data;
+	}
+	apply_u214_port_b_lines(previous_driven);
+}
+
+void herojr_state::apply_u214_port_b_lines(u8 previous_driven)
+{
+	const u8 driven = u214_port_b_driven();
+	m_u214_port_b_output = driven;
+	update_steering_position(driven);
+	if ((driven & 0x3e) != 0)
 	{
 		m_drive_activity_count++;
 		m_drive_activity = m_drive_activity_count;
 	}
-	if (drive_feedback_active())
+	if (BIT(driven, 1))
 	{
 		// Drive enable live: encoder pulses come only from the generator —
 		// a $D821 write is not an encoder event (the pre-remediation
 		// per-write sample advance is retired, spec §7.1). Track the
 		// commanded direction for the world model and cancel any pending
 		// coast tail (the motor is powered again).
-		m_drive_direction = BIT(data, 0) ? 1 : 0;
+		m_drive_direction = BIT(driven, 0) ? 1 : 0;
 		m_wheel_coast_remaining = 0;
 	}
-	else if (was_driving)
+	else if (BIT(previous_driven, 1))
 	{
 		// D1 falling edge: the wheel spins down — ≈2 s of continued
 		// pulses (spec §7.2 coast-tail APPROXIMATION, constant above).
@@ -1085,11 +1172,11 @@ void herojr_state::u214_port_b_w(u8 data)
 	}
 	// HERO Jr Technical Manual: $D821 D1 controls main drive motor A2,
 	// D0 controls relay RY301 for direction, and D2-D5 drive steering phases.
-	m_motor_left = BIT(data, 1) ? 1 : 0;
-	m_motor_right = BIT(data, 0) ? 1 : 0;
-	m_port_outputs[3] = (data & 0x3c) << 2;
-	m_port_outputs[5] = (BIT(data, 1) ? 0x40 : 0x00) | (BIT(data, 0) ? 0x80 : 0x00);
-	driver_tracef("u214_port_b_w data=$%02X latched=$%02X drive_activity=%u cb1_flag=%u coast_remaining=%u steering_position=%d steering_limit=$%02X", data, m_u214_port_b, m_drive_activity_count, m_u214_cb1_flag, m_wheel_coast_remaining, m_steering_position, steering_limit_mask());
+	m_motor_left = BIT(driven, 1) ? 1 : 0;
+	m_motor_right = BIT(driven, 0) ? 1 : 0;
+	m_port_outputs[3] = (driven & 0x3c) << 2;
+	m_port_outputs[5] = (BIT(driven, 1) ? 0x40 : 0x00) | (BIT(driven, 0) ? 0x80 : 0x00);
+	driver_tracef("u214_port_b_lines driven=$%02X latched=$%02X ddr_b=$%02X drive_activity=%u cb1_flag=%u coast_remaining=%u steering_position=%d steering_limit=$%02X", driven, m_u214_port_b, m_u214_ddr_b, m_drive_activity_count, m_u214_cb1_flag, m_wheel_coast_remaining, m_steering_position, steering_limit_mask());
 	update_u214_input_outputs();
 }
 
