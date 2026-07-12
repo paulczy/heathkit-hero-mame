@@ -92,7 +92,6 @@ local read_watchpoints_by_index = {}
 local read_watchpoint_one_shot_by_index = {}
 local temp_step_breakpoints = {}
 local last_stop_pc = nil
-local console_log_last = 0
 local last_io_state_encoded = nil
 local last_io_broadcast_time = 0
 local sensor_state = {
@@ -349,7 +348,17 @@ local subscriptions = {}
 local pending_step_reason = nil
 local pending_step_start_pc = nil
 local pending_step_seen_run = false
-local pending_herojr_reset_release_frames = 0
+-- reset_machine engage window (HERO Jr panel RESET pulse). Non-nil while
+-- the modeled panel button is held: the EMULATED-time instant at which the
+-- pulse is released. MAME samples ioport fields only at emulated frame
+-- boundaries (ioport_manager::frame_update), so the hold must be measured
+-- in emulated time — a pump-frame countdown kept running while the machine
+-- was PAUSED (video repaints pump without emulated progress), letting the
+-- 0->1->0 pulse complete unsampled and silently losing the reset
+-- (deterministic: conformance/tools/reproHerojrResetLoss.js, and the
+-- G2J-05 $AA gate red "Missing $9FDD ... PCs $9FE7",
+-- conformance-2026-07-12T13-34-48Z.log).
+local herojr_reset_release_at = nil
 local supported_commands = {
   "get_capabilities",
   "get_registers",
@@ -1969,7 +1978,20 @@ local function reset_machine(params)
       error("reset_machine requires HERO Jr RESET input")
     end
     write_u8(herojr_sensor_base + 0x03, 0)
-    pending_herojr_reset_release_frames = 2
+    -- Hold the modeled panel button for 40 ms of EMULATED time (>= two
+    -- ioport frame_update samples at 60 Hz; a human press holds far
+    -- longer), then release in the pump. Until the release, the machine
+    -- may still execute up to a frame of the DYING boot before the
+    -- asserted line is sampled; debugger points are disabled across that
+    -- window so no stale-boot stop leaks into the post-reset event stream
+    -- (and a tight stale-boot breakpoint loop cannot stall the engage).
+    -- They are re-enabled at the release write, which the suspended CPU
+    -- cannot outrun: boot code only executes after the release edge is
+    -- sampled one frame later. Deterministic both ways in
+    -- conformance/tools/reproHerojrResetLoss.js (stopped-reset clause).
+    cpu_debug():bpdisable()
+    cpu_debug():wpdisable()
+    herojr_reset_release_at = emulated_time_seconds() + 0.040
   else
     manager.machine:soft_reset()
   end
@@ -2216,10 +2238,15 @@ local function poll()
     emu.print_info(log_prefix() .. ": bridge listening on " .. host .. ":" .. tostring(port) .. " via LuaSocket")
   end
 
-  if pending_herojr_reset_release_frames > 0 then
-    pending_herojr_reset_release_frames = pending_herojr_reset_release_frames - 1
-    if pending_herojr_reset_release_frames == 0 then
-      set_herojr_reset_field(false)
+  if herojr_reset_release_at and emulated_time_seconds() >= herojr_reset_release_at then
+    herojr_reset_release_at = nil
+    set_herojr_reset_field(false)
+    -- The CPU is suspended in reset until the release edge is sampled at
+    -- the next emulated frame boundary, so re-enabling here can never miss
+    -- a fresh-boot stop.
+    if cpu_debug_available() then
+      cpu_debug():bpenable()
+      cpu_debug():wpenable()
     end
   end
 
@@ -2243,14 +2270,26 @@ local function poll()
   -- serviced requests first, a `continue` already queued on the socket —
   -- the client answering the PREVIOUS stop, with the two breakpoints only a
   -- few instructions apart ($9FDD/$9FE7) — flipped execution_state to "run"
-  -- before the scan, and the "run" branch below then discarded the
-  -- printed-but-never-broadcast "Stopped at breakpoint" console line
-  -- (console_log_last fast-forward): the stop was lost permanently.
-  -- Deterministic both ways in conformance/tools/reproG2j05.ts
-  -- (queued-continue scenario): request-first eats a stop 8/8, scan-first
-  -- reports 8/8. Scanning first is safe: within one pump no instructions
-  -- execute, so the scan sees the authoritative pre-request state, and a
-  -- continue serviced afterwards simply resumes the just-broadcast stop.
+  -- before the scan, and the stop was lost permanently. Deterministic both
+  -- ways in conformance/tools/reproG2j05.ts (queued-continue scenario):
+  -- request-first eats a stop 8/8, scan-first reports 8/8. Scanning first is
+  -- safe: within one pump no instructions execute, so the scan sees the
+  -- authoritative pre-request state, and a continue serviced afterwards
+  -- simply resumes the just-broadcast stop.
+  --
+  -- Stop IDENTITY comes from the debugger's own triggered-point state
+  -- (device_debug triggered_breakpoint()/triggered_watchpoint() — the same
+  -- read-and-clear accessors the gdbstub OSD consumes), never from console
+  -- text. The retired console scan (R3 remediation, 2026-07-12) matched
+  -- "Stopped at breakpoint ([0-9]+)" against MAME's "%X"-formatted HEX
+  -- index: the tenth breakpoint index of a session prints as "A", matches
+  -- nothing, and every later stop was silently dropped for the rest of the
+  -- session (conformance/tools/reproR3StopDetection.ts clause C wedged at
+  -- round 7 = index $A pre-fix); its last_stop_pc dedup could also eat a
+  -- legitimate immediate same-address re-stop. Each genuine halt sets the
+  -- triggered pointer fresh, so a stop→continue→same-address-stop
+  -- broadcasts every time, and the read-and-clear semantics make a
+  -- double-broadcast impossible.
   if manager.machine.debugger and manager.machine.debugger.execution_state == "stop" then
     if pending_step_reason then
       local addr = get_register("pc")
@@ -2265,64 +2304,74 @@ local function poll()
         pending_step_seen_run = false
       end
     end
-    local consolelog = manager.machine.debugger.consolelog
-    local count = #consolelog
-    for index = console_log_last + 1, count do
-      local message = consolelog[index]
-      local breakpoint_index = message and tonumber(message:match("Stopped at breakpoint ([0-9]+)"))
-      if breakpoint_index then
-        trace("debugger console stopped breakpoint index=" .. tostring(breakpoint_index) .. " message=" .. tostring(message))
+    if cpu_debug_available() then
+      -- Drain BOTH pointers every stopped pump so nothing stale can ever
+      -- be attributed to a later stop (a clear_temp_step_breakpoints above
+      -- already nulls a triggered temp breakpoint fork-side on bpclear).
+      local triggered_bp = cpu_debug():triggered_breakpoint()
+      local triggered_wp = cpu_debug():triggered_watchpoint()
+      if herojr_reset_release_at then
+        -- Belt-and-suspenders: points are disabled across the reset engage
+        -- window, so no stop should reach here; if one does (e.g. a stop
+        -- already in flight when reset_machine was serviced), it belongs
+        -- to the dying boot — never broadcast it as a protocol event.
+        if triggered_bp or triggered_wp then
+          trace("suppressed stale-boot stop during reset engage pc=" .. trace_address(get_register("pc")))
+        end
+        triggered_bp = nil
+        triggered_wp = nil
       end
-      local watchpoint_index = message and tonumber(message:match("Stopped at watchpoint ([0-9]+)"))
-      if watchpoint_index then
-        trace("debugger console stopped watchpoint index=" .. tostring(watchpoint_index) .. " message=" .. tostring(message))
+      if triggered_bp then
+        local breakpoint_index = triggered_bp.index
+        local temp_addr = temp_step_breakpoints[breakpoint_index]
+        local addr = breakpoints_by_index[breakpoint_index]
+        if temp_addr then
+          local current_pc = get_register("pc")
+          debugger_manager().execution_state = "stop"
+          emu.pause()
+          clear_temp_step_breakpoints()
+          last_stop_pc = current_pc
+          trace("broadcast stopped reason=step addr=" .. trace_address(current_pc))
+          broadcast_event("stopped", { reason = "step", addr = current_pc })
+          pending_step_reason = nil
+          pending_step_start_pc = nil
+          pending_step_seen_run = false
+        elseif addr then
+          debugger_manager().execution_state = "stop"
+          emu.pause()
+          last_stop_pc = addr
+          trace("broadcast stopped reason=breakpoint addr=" .. trace_address(addr) .. " index=" .. tostring(breakpoint_index))
+          broadcast_event("stopped", { reason = "breakpoint", addr = addr, breakpoint = breakpoint_index })
+        end
       end
-      local temp_addr = breakpoint_index and temp_step_breakpoints[breakpoint_index]
-      local addr = breakpoint_index and breakpoints_by_index[breakpoint_index]
-      local watch_addr = watchpoint_index and read_watchpoints_by_index[watchpoint_index]
-      if temp_addr then
-        local current_pc = get_register("pc")
-        debugger_manager().execution_state = "stop"
-        emu.pause()
-        clear_temp_step_breakpoints()
-        last_stop_pc = current_pc
-        trace("broadcast stopped reason=step addr=" .. trace_address(current_pc))
-        broadcast_event("stopped", { reason = "step", addr = current_pc })
-        pending_step_reason = nil
-        pending_step_start_pc = nil
-        pending_step_seen_run = false
-      elseif addr and last_stop_pc ~= addr then
-        debugger_manager().execution_state = "stop"
-        emu.pause()
-        last_stop_pc = addr
-        trace("broadcast stopped reason=breakpoint addr=" .. trace_address(addr) .. " index=" .. tostring(breakpoint_index))
-        broadcast_event("stopped", { reason = "breakpoint", addr = addr, breakpoint = breakpoint_index })
-      elseif watch_addr then
-        local current_pc = get_register("pc")
-        local value = read_u8(watch_addr)
-        debugger_manager().execution_state = "stop"
-        emu.pause()
-        last_stop_pc = current_pc
-        trace("broadcast stopped reason=robotLanguageRead addr=" .. trace_address(watch_addr) .. " value=$" .. string.format("%02X", value) .. " pc=" .. trace_address(current_pc) .. " index=" .. tostring(watchpoint_index))
-        broadcast_event("stopped", {
-          reason = "robotLanguageRead",
-          addr = watch_addr,
-          pc = current_pc,
-          value = value,
-          watchpoint = watchpoint_index
-        })
-        if read_watchpoint_one_shot_by_index[watchpoint_index] then
-          clear_read_watchpoint_by_index(watchpoint_index)
+      if triggered_wp then
+        local watchpoint_index = triggered_wp.index
+        local watch_addr = read_watchpoints_by_index[watchpoint_index]
+        if watch_addr then
+          local current_pc = get_register("pc")
+          local value = read_u8(watch_addr)
+          debugger_manager().execution_state = "stop"
+          emu.pause()
+          last_stop_pc = current_pc
+          trace("broadcast stopped reason=robotLanguageRead addr=" .. trace_address(watch_addr) .. " value=$" .. string.format("%02X", value) .. " pc=" .. trace_address(current_pc) .. " index=" .. tostring(watchpoint_index))
+          broadcast_event("stopped", {
+            reason = "robotLanguageRead",
+            addr = watch_addr,
+            pc = current_pc,
+            value = value,
+            watchpoint = watchpoint_index
+          })
+          if read_watchpoint_one_shot_by_index[watchpoint_index] then
+            clear_read_watchpoint_by_index(watchpoint_index)
+          end
         end
       end
     end
-    console_log_last = count
   elseif manager.machine.debugger and manager.machine.debugger.execution_state == "run" then
     if pending_step_reason then
       pending_step_seen_run = true
     end
     last_stop_pc = nil
-    console_log_last = #manager.machine.debugger.consolelog
   end
 
   if server then
@@ -2368,18 +2417,12 @@ local function poll()
   -- landings) expires with pending_step_seen_run still false and a landing
   -- PC equal to the start PC (tight RTC poll loop), so the runFor stop is
   -- never broadcast and the auto-resume runs away (gate
-  -- conformance-2026-07-10T16-06-09Z, both G1J-09 subtests). Clearing
-  -- last_stop_pc here likewise keeps a legitimate immediate same-address
-  -- re-stop after a continue detectable, as it was under the old order.
-  -- Safe: the machine executes no instructions inside a pump, so no stop
-  -- console line can appear between the scan above and this point — the
-  -- fast-forward only skips request-generated command echo.
+  -- conformance-2026-07-10T16-06-09Z, both G1J-09 subtests).
   if manager.machine.debugger and manager.machine.debugger.execution_state == "run" then
     if pending_step_reason then
       pending_step_seen_run = true
     end
     last_stop_pc = nil
-    console_log_last = #manager.machine.debugger.consolelog
   end
 
   broadcast_phoneme_events()
