@@ -493,8 +493,6 @@ void mc146818_device::update_timer()
 
 	attotime update_period = attotime::never;
 	attotime update_interval = attotime::never;
-	attotime periodic_period = attotime::never;
-	attotime periodic_interval = attotime::never;
 
 	if (bypass < 22)
 	{
@@ -505,11 +503,32 @@ void mc146818_device::update_timer()
 		// TODO: take the time since last timer into account
 		update_period = attotime::from_hz(update_hz * 2);
 		update_interval = attotime::from_hz(update_hz);
+	}
 
+	m_clock_timer->adjust(update_period, 0, update_interval);
+	update_periodic_timer();
+}
+
+//----------------------------------------------------------
+//  update_periodic_timer - retune the periodic/SQW rate
+//  from the RS bits without disturbing the update cycle
+//  (datasheet: RS3-RS0 select a divider-chain tap for the
+//  periodic interrupt only; they never reset the chain)
+//----------------------------------------------------------
+
+void mc146818_device::update_periodic_timer()
+{
+	int bypass = get_timer_bypass();
+
+	attotime periodic_period = attotime::never;
+	attotime periodic_interval = attotime::never;
+
+	if (bypass < 22)
+	{
 		int rate_select = m_data[REG_A] & (REG_A_RS3 | REG_A_RS2 | REG_A_RS1 | REG_A_RS0);
 		if (rate_select != 0)
 		{
-			shift = (rate_select + 6) - bypass;
+			int shift = (rate_select + 6) - bypass;
 			if (shift <= 1)
 				shift += 7;
 
@@ -522,7 +541,6 @@ void mc146818_device::update_timer()
 		}
 	}
 
-	m_clock_timer->adjust(update_period, 0, update_interval);
 	m_periodic_timer->adjust(periodic_period, 0, periodic_interval);
 }
 
@@ -689,11 +707,24 @@ void mc146818_device::internal_write(offs_t offset, uint8_t data)
 		break;
 
 	case REG_A:
-		// top bit of A is read only
+		// top bit of A (UIP) is read only and survives writes; only a
+		// change to the DV divider bits touches the update cycle — an
+		// RS-only write retunes the periodic/SQW tap without re-anchoring
+		// the seconds update (MC146818 datasheet: the divider chain is
+		// reset/released via DV=11x only, first update 500 ms after
+		// release; a divider reset also holds UIP clear).
 		if ((data ^ m_data[REG_A]) & ~REG_A_UIP)
 		{
-			m_data[REG_A] = data & ~REG_A_UIP;
-			update_timer();
+			uint8_t const dv_mask = REG_A_DV2 | REG_A_DV1 | REG_A_DV0;
+			bool const dv_changed = ((data ^ m_data[REG_A]) & dv_mask) != 0;
+			uint8_t value = (data & ~REG_A_UIP) | (m_data[REG_A] & REG_A_UIP);
+			if ((value & (REG_A_DV2 | REG_A_DV1)) == (REG_A_DV2 | REG_A_DV1))
+				value &= ~REG_A_UIP;
+			m_data[REG_A] = value;
+			if (dv_changed)
+				update_timer();
+			else
+				update_periodic_timer();
 		}
 		break;
 

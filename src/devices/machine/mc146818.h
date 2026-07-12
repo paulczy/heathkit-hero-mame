@@ -142,6 +142,7 @@ protected:
 	int from_ram(int a) const;
 	void update_irq();
 	void update_timer();
+	void update_periodic_timer();
 	virtual int get_timer_bypass() const;
 	int get_seconds() const;
 	void set_seconds(int seconds);
