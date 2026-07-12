@@ -1308,6 +1308,10 @@ bool device_debug::breakpoint_clear(int index)
 	for (auto bpit = m_bplist.begin(); bpit != m_bplist.end(); ++bpit)
 		if (bpit->second->m_index == index)
 		{
+			// never leave a dangling triggered pointer behind (consumers:
+			// gdbstub, Lua triggered_breakpoint())
+			if (m_triggered_breakpoint == bpit->second.get())
+				m_triggered_breakpoint = nullptr;
 			m_bplist.erase(bpit);
 			breakpoint_update_flags();
 			return true;
@@ -1325,6 +1329,7 @@ bool device_debug::breakpoint_clear(int index)
 void device_debug::breakpoint_clear_all()
 {
 	// clear the list
+	m_triggered_breakpoint = nullptr;
 	m_bplist.clear();
 	breakpoint_update_flags();
 }
@@ -1398,6 +1403,9 @@ bool device_debug::watchpoint_clear(int index)
 		for (auto wpi = wpl.begin(); wpi != wpl.end(); wpi++)
 			if ((*wpi)->index() == index)
 			{
+				// never leave a dangling triggered pointer behind
+				if (m_triggered_watchpoint == wpi->get())
+					m_triggered_watchpoint = nullptr;
 				wpl.erase(wpi);
 				return true;
 			}
@@ -1414,6 +1422,7 @@ bool device_debug::watchpoint_clear(int index)
 
 void device_debug::watchpoint_clear_all()
 {
+	m_triggered_watchpoint = nullptr;
 	for (auto &wpl : m_wplist)
 		wpl.clear();
 }

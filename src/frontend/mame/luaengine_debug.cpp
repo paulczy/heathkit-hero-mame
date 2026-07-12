@@ -478,6 +478,17 @@ void lua_engine::initialize_debug(sol::table &emu)
 					table[wpp->index()] = sol::make_reference(sol(), wpp.get());
 				return table;
 			});
+	// Read-and-clear accessors for the point that caused the current halt.
+	// These expose the debugger's own stop identity (set by
+	// device_debug::breakpoint_check / debug_watchpoint::triggered) so a
+	// Lua frontend can attribute a stop without parsing console text; the
+	// gdbstub OSD module consumes the same state. Returns nil when no
+	// breakpoint/watchpoint triggered since the last call (or since the
+	// point was cleared).
+	device_debug_type.set_function("triggered_breakpoint",
+			[] (device_debug &dev) { return dev.triggered_breakpoint(); });
+	device_debug_type.set_function("triggered_watchpoint",
+			[] (device_debug &dev) { return dev.triggered_watchpoint(); });
 
 
 	auto breakpoint_type = sol().registry().new_usertype<debug_breakpoint>("breakpoint", sol::no_constructor);
