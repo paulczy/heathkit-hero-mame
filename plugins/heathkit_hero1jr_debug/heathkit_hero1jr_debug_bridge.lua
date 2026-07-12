@@ -2239,14 +2239,17 @@ local function poll()
   end
 
   if herojr_reset_release_at and emulated_time_seconds() >= herojr_reset_release_at then
-    herojr_reset_release_at = nil
-    set_herojr_reset_field(false)
-    -- The CPU is suspended in reset until the release edge is sampled at
-    -- the next emulated frame boundary, so re-enabling here can never miss
-    -- a fresh-boot stop.
+    -- Re-enable the debugger points BEFORE releasing the button, and only
+    -- release once that succeeded: the CPU is suspended in reset until the
+    -- release edge is sampled at the next emulated frame boundary, so this
+    -- order can never miss a fresh-boot stop — and should the debugger
+    -- ever be unavailable here, the fail-safe is a still-held RESET, never
+    -- a session with silently disabled breakpoints.
     if cpu_debug_available() then
       cpu_debug():bpenable()
       cpu_debug():wpenable()
+      herojr_reset_release_at = nil
+      set_herojr_reset_field(false)
     end
   end
 
