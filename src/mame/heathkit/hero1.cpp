@@ -258,6 +258,8 @@ private:
 	void update_speech_power();
 	TIMER_CALLBACK_MEMBER(executive_timer_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
+	TIMER_CALLBACK_MEMBER(sonar_train_tick);
+	void start_sonar_ping();
 	TIMER_CALLBACK_MEMBER(wheel_pulse_tick);
 
 	template <typename... FormatParams>
@@ -346,6 +348,7 @@ private:
 	bool m_driver_trace = false;
 	emu_timer *m_executive_timer = nullptr;
 	emu_timer *m_sonar_timer = nullptr;
+	emu_timer *m_sonar_train_timer = nullptr;
 	emu_timer *m_wheel_timer = nullptr;
 };
 
@@ -434,6 +437,7 @@ void hero1_state::machine_start()
 
 	m_executive_timer = timer_alloc(FUNC(hero1_state::executive_timer_tick), this);
 	m_sonar_timer = timer_alloc(FUNC(hero1_state::sonar_echo_tick), this);
+	m_sonar_train_timer = timer_alloc(FUNC(hero1_state::sonar_train_tick), this);
 	m_wheel_timer = timer_alloc(FUNC(hero1_state::wheel_pulse_tick), this);
 	driver_tracef("machine_start trace enabled");
 }
@@ -510,6 +514,7 @@ void hero1_state::machine_reset()
 	update_irq_line();
 	m_executive_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
 	m_sonar_timer->adjust(attotime::never);
+	m_sonar_train_timer->adjust(attotime::never);
 	// The drive latch was just cleared (D6 = 0, motor off): no pulses.
 	// The odometer count itself is mechanical state and survives.
 	m_wheel_timer->adjust(attotime::never);
@@ -851,11 +856,13 @@ void hero1_state::port_c200_control_w(u8 data)
 	m_interrupt_clear_latch = data;
 	m_interrupt_status &= data;
 	// The $01 clear line is also the ranging-counter clear (H1-TM printed
-	// p. 81: after reading $C220 the CPU sends a clear along P304 pin 33 —
-	// "Like the transmit pulse, this resets counter U313 and output
-	// flip-flop U318"). Reset the at-rest latched byte; a ping in flight is
-	// untouched (firmware only clears after sonar-ready, never mid-count —
-	// the RL enable handler's settle delay outlasts every ping).
+	// p. 81: after reading $C220 the CPU's clear "resets counter U313 and
+	// output flip-flop U318" like the transmit pulse; p. 81 prints "along
+	// P304 pin 33" but sheet 3 labels pin 33 MOTION DETECT — the range
+	// timing line is P304 pin 31, recorded erratum #14, 2026-07-13).
+	// Reset the at-rest latched byte; a ping in flight is untouched
+	// (firmware only clears after sonar-ready, never mid-count — the RL
+	// enable handler's settle delay outlasts every ping).
 	if (!BIT(data, 0) && !m_sonar_ping_active)
 		m_sonar_counter = 0;
 	update_irq_line();
@@ -975,26 +982,35 @@ void hero1_state::port_c2e0_system_select_w(u8 data)
 		// ~9.16 us/step constant returned echoes ~6.7x early). Aperture
 		// byte 0 models "no echo within range": U313 Q10 goes high FIRST
 		// at raw 512 (15.625 ms) and sets the U319A/U319D max-range latch
-		// instead ("about 8 feet"). Power changes never touch the
-		// interrupt flip-flops themselves (spec §1.8).
-		m_sonar_ping_active = true;
-		m_sonar_ping_start = machine().time();
-		const u32 target_raw = (m_sonar_count != 0) ? (u32(m_sonar_count) * 2 + 1) : 512;
-		m_sonar_timer->adjust(attotime::from_ticks(target_raw, 32768));
+		// instead ("about 8 feet"). While power stays on, the transmit
+		// board FREE-RUNS: its 14-stage U103/U104 chain wraps "about 1/4
+		// second" per cycle and bursts the transducer each wrap (H1-TM
+		// printed p. 76; nominal 8192 counts at 32.768 kHz — the hardware
+		// oscillator is an R108-adjustable ~32 kHz RC; the printed "4096
+		// counts" is recorded erratum #12), so a fresh ranging count
+		// starts every nominal 0.25 s (R4/P1 ruling, 2026-07-13). The
+		// first ping fires at power-on ("A pulse comes into the I/O board
+		// on P311 pin 80 when the ultrasonic transmitter is turned on",
+		// p. 81). Power changes never touch the interrupt flip-flops
+		// themselves (spec §1.8).
+		start_sonar_ping();
+		const attotime train_period = attotime::from_ticks(8192, 32768);
+		m_sonar_train_timer->adjust(train_period, 0, train_period);
 	}
 	else if (previous_sonar_power && !BIT(data, 1))
 	{
-		// Power off mid-flight: the transmit/receive boards lose power, so
-		// no echo can return; the modeled gate freezes at the live count
-		// without raising sonar-ready. Firmware never disables inside a
-		// flight — the RL enable handler's own settle delay ($E0FB,
-		// 4096x8 cycles) outlasts the longest 15.625 ms ping.
+		// Power off: the transmit/receive boards lose power — the train
+		// stops and no echo can return; a gate mid-flight freezes at the
+		// live count without raising sonar-ready. Firmware never disables
+		// inside a flight — the RL enable handler's own settle delay
+		// ($E0FB, 4096x8 cycles) outlasts the longest 15.625 ms ping.
 		if (m_sonar_ping_active)
 		{
 			m_sonar_counter = u8((live_sonar_raw_count() >> 1) & 0xff);
 			m_sonar_ping_active = false;
 		}
 		m_sonar_timer->adjust(attotime::never);
+		m_sonar_train_timer->adjust(attotime::never);
 	}
 }
 
@@ -1244,6 +1260,18 @@ TIMER_CALLBACK_MEMBER(hero1_state::executive_timer_tick)
 	latch_interrupt(0x10);
 }
 
+// One ranging cycle: the transmit pulse resets U313 and re-opens the U319C
+// gate — "The count always begins from zero" (H1-TM printed p. 81). The
+// echo (or the Q10 max-range latch for aperture byte 0) is scheduled at the
+// distance's raw count on the 32.768 kHz reference.
+void hero1_state::start_sonar_ping()
+{
+	m_sonar_ping_active = true;
+	m_sonar_ping_start = machine().time();
+	const u32 target_raw = (m_sonar_count != 0) ? (u32(m_sonar_count) * 2 + 1) : 512;
+	m_sonar_timer->adjust(attotime::from_ticks(target_raw, 32768));
+}
+
 TIMER_CALLBACK_MEMBER(hero1_state::sonar_echo_tick)
 {
 	// SONAR (U408A): the echo — or the Q10 max-range latch for aperture
@@ -1253,6 +1281,14 @@ TIMER_CALLBACK_MEMBER(hero1_state::sonar_echo_tick)
 	m_sonar_ping_active = false;
 	m_sonar_counter = m_sonar_count;
 	latch_interrupt(0x01);
+}
+
+TIMER_CALLBACK_MEMBER(hero1_state::sonar_train_tick)
+{
+	// Free-running transmit cycle while sonar power is on (H1-TM printed
+	// p. 76; nominal 0.25 s — see port_c2e0_system_select_w). Each burst
+	// starts a fresh ranging count against the resident world distance.
+	start_sonar_ping();
 }
 
 void hero1_state::update_pendant_port(u8 data)
