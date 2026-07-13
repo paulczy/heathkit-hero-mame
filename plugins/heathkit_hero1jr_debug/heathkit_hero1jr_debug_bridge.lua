@@ -359,6 +359,34 @@ local pending_step_seen_run = false
 -- G2J-05 $AA gate red "Missing $9FDD ... PCs $9FE7",
 -- conformance-2026-07-12T13-34-48Z.log).
 local herojr_reset_release_at = nil
+-- Deferred reset_machine acknowledgement (R2 remediation, 2026-07-13).
+-- machine:soft_reset() only SCHEDULES a zero-time scheduler timer
+-- (running_machine::schedule_soft_reset, machine.cpp), and the herojr panel
+-- pulse only completes after emulated frames elapse — so answering the RPC
+-- immediately let the client pause the machine BEFORE the reset had
+-- executed. The pending soft reset then fired on the client's eventual
+-- continue, re-vectoring the CPU into the boot ROM and discarding the
+-- client's post-"reset" setup (PC-to-entry): G3-01's "verified but never
+-- firing" read watchpoint (tech-debt #13's ~30%/launch dead install) was a
+-- perfectly-installed watchpoint whose fixture program never ran
+-- (conformance/tools/reproR2WatchpointDeadInstall.ts, boot-ROM PC samples
+-- on every dead launch). The response is therefore withheld until the
+-- machine has OBSERVABLY reset:
+--   hero1:  the machine-reset notifier fired (the scheduled soft reset ran
+--           — a zero-delay timer, so no instruction can execute first);
+--   herojr: the pulse release write happened AND either 40 ms of emulated
+--           time passed (>= two 60 Hz ioport samples, so the deasserted
+--           line was sampled and the CPU is out of reset) or a genuine
+--           debugger stop was broadcast (instructions executed, so the CPU
+--           is out of reset; without this escape a client breakpoint on
+--           the boot path would pause emulated time and deadlock the
+--           acknowledgement — tier-1 reset-entry does exactly that).
+local pending_reset_ack = nil       -- { client, id }; single-client protocol
+local machine_reset_count = 0       -- bumped by the machine-reset notifier
+local machine_reset_baseline = 0    -- count captured when the reset was requested
+local herojr_reset_respond_at = nil -- emulated instant the release is provably sampled
+local reset_ack_stop_seen = false   -- genuine stop broadcast since reset_machine
+local DEFER_RESPONSE = {}           -- handler sentinel: the pump owns the response
 local supported_commands = {
   "get_capabilities",
   "get_registers",
@@ -757,6 +785,9 @@ end
 local drop_framing_state
 
 local function drop_client(client)
+  if pending_reset_ack and pending_reset_ack.client == client then
+    pending_reset_ack = nil
+  end
   pcall(function() client:close() end)
   receive_buffers[client] = nil
   if drop_framing_state then
@@ -1951,6 +1982,11 @@ end
 
 local function reset_machine(params)
   local preserve_herojr_keys = system_name() == "herojr" and params and params.preserveKeys == true
+  -- Arm the deferred-acknowledgement state BEFORE the reset is initiated so
+  -- no completion signal can be missed (see the pending_reset_ack note).
+  machine_reset_baseline = machine_reset_count
+  herojr_reset_respond_at = nil
+  reset_ack_stop_seen = false
   clear_temp_step_breakpoints()
   if not preserve_herojr_keys then
     keypad_state = {}
@@ -1998,7 +2034,10 @@ local function reset_machine(params)
   emu.unpause()
   cpu_debug():go()
   broadcast_io_changed(true)
-  return {}
+  -- The pump answers this request once the reset has observably completed;
+  -- an immediate response would let the client pause the machine with the
+  -- reset still pending (the R2 dead-install mechanism).
+  return DEFER_RESPONSE
 end
 
 local handlers = {
@@ -2114,6 +2153,20 @@ local function handle_request(client, line)
   trace("request #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " pc=" .. trace_address(get_register("pc")))
   local success, result = xpcall(function() return handler(request.params or {}) end, debug.traceback)
   if success then
+    if result == DEFER_RESPONSE then
+      if pending_reset_ack then
+        -- Unreachable for a request/await client; answer a superseded
+        -- reset honestly rather than orphaning its id.
+        send_response(pending_reset_ack.client, {
+          id = pending_reset_ack.id,
+          ok = false,
+          error = "superseded by a newer reset_machine"
+        })
+      end
+      pending_reset_ack = { client = client, id = request.id or json_null }
+      trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " deferred until the reset completes")
+      return true
+    end
     trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " ok")
     return send_response(client, { id = request.id or json_null, ok = true, result = result or {} })
   end
@@ -2250,6 +2303,11 @@ local function poll()
       cpu_debug():wpenable()
       herojr_reset_release_at = nil
       set_herojr_reset_field(false)
+      -- The deasserted line is only SAMPLED at emulated frame boundaries;
+      -- 40 ms (>= two 60 Hz samples, the engage window's own constant)
+      -- past the release write guarantees the CPU is out of reset before
+      -- a deferred reset_machine acknowledgement is flushed.
+      herojr_reset_respond_at = emulated_time_seconds() + 0.040
     end
   end
 
@@ -2301,6 +2359,7 @@ local function poll()
         debugger_manager().execution_state = "stop"
         emu.pause()
         clear_temp_step_breakpoints()
+        reset_ack_stop_seen = true
         broadcast_event("stopped", { reason = pending_step_reason, addr = addr })
         pending_step_reason = nil
         pending_step_start_pc = nil
@@ -2334,6 +2393,7 @@ local function poll()
           emu.pause()
           clear_temp_step_breakpoints()
           last_stop_pc = current_pc
+          reset_ack_stop_seen = true
           trace("broadcast stopped reason=step addr=" .. trace_address(current_pc))
           broadcast_event("stopped", { reason = "step", addr = current_pc })
           pending_step_reason = nil
@@ -2343,6 +2403,7 @@ local function poll()
           debugger_manager().execution_state = "stop"
           emu.pause()
           last_stop_pc = addr
+          reset_ack_stop_seen = true
           trace("broadcast stopped reason=breakpoint addr=" .. trace_address(addr) .. " index=" .. tostring(breakpoint_index))
           broadcast_event("stopped", { reason = "breakpoint", addr = addr, breakpoint = breakpoint_index })
         end
@@ -2356,6 +2417,7 @@ local function poll()
           debugger_manager().execution_state = "stop"
           emu.pause()
           last_stop_pc = current_pc
+          reset_ack_stop_seen = true
           trace("broadcast stopped reason=robotLanguageRead addr=" .. trace_address(watch_addr) .. " value=$" .. string.format("%02X", value) .. " pc=" .. trace_address(current_pc) .. " index=" .. tostring(watchpoint_index))
           broadcast_event("stopped", {
             reason = "robotLanguageRead",
@@ -2375,6 +2437,30 @@ local function poll()
       pending_step_seen_run = true
     end
     last_stop_pc = nil
+  end
+
+  -- Flush a deferred reset_machine acknowledgement once the reset has
+  -- observably completed (see the pending_reset_ack note). Runs after the
+  -- stop scan so a genuine stop broadcast THIS pump already counts, and
+  -- before request servicing so the client's next command can only ever be
+  -- seen after its reset completed.
+  if pending_reset_ack then
+    local reset_done
+    if system_name() == "herojr" then
+      reset_done = herojr_reset_release_at == nil and herojr_reset_respond_at ~= nil
+        and (emulated_time_seconds() >= herojr_reset_respond_at or reset_ack_stop_seen)
+    else
+      reset_done = machine_reset_count > machine_reset_baseline
+    end
+    if reset_done then
+      local ack = pending_reset_ack
+      pending_reset_ack = nil
+      herojr_reset_respond_at = nil
+      trace("response #" .. tostring(ack.id) .. " reset_machine ok (deferred until the reset completed)")
+      if not send_response(ack.client, { id = ack.id, ok = true, result = {} }) then
+        drop_client(ack.client)
+      end
+    end
   end
 
   if server then
@@ -2437,6 +2523,12 @@ function bridge.start()
   server:settimeout(0)
   emu.register_periodic(poll)
   emu.register_frame_done(poll)
+  -- Completion signal for the deferred reset_machine acknowledgement:
+  -- running_machine::soft_reset() calls the machine-reset notifiers, so a
+  -- count increment proves the scheduled reset actually executed.
+  subscriptions[#subscriptions + 1] = emu.add_machine_reset_notifier(function()
+    machine_reset_count = machine_reset_count + 1
+  end)
   subscriptions[#subscriptions + 1] = emu.add_machine_stop_notifier(function()
     bridge_serving = false
     bridge_no_debugger_polls = 0
