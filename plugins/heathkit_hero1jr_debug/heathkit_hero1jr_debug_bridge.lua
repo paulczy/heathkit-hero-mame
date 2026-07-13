@@ -2274,6 +2274,21 @@ local function bridge_ready_to_serve()
     end
     return false
   end
+  if machine_reset_count < 1 then
+    -- The machine's INITIAL reset has not run yet. running_machine::run()
+    -- performs its unconditional startup soft reset AFTER Lua periodic
+    -- callbacks already pump, so without this gate the "bridge listening"
+    -- readiness line printed in the pre-reset window on every launch and a
+    -- fast client could be served there — its writes then silently wiped
+    -- when the initial reset restored driver defaults. That is the same
+    -- wipe class bridge_ready_to_serve was built against (2026-06-10), with
+    -- the residual window measured once as G1H-06's $D100 = 134 (the hero1
+    -- machine_reset default) in gate conformance-2026-07-13T22-04-04Z (R4
+    -- closure). The machine-reset notifier is registered in bridge.start(),
+    -- before the machine runs, so it always counts the initial reset;
+    -- reproR4ResetGateOrder pins the contract ordering in both directions.
+    return false
+  end
   return true
 end
 
