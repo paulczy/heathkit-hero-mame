@@ -212,6 +212,7 @@ private:
 	u8 sensor_r(offs_t offset);
 	u8 port_c200_interrupt_r();
 	u8 port_c220_sonar_r();
+	u32 live_sonar_raw_count() const;
 	u8 port_c240_sense_r();
 	u8 port_c260_limits_speech_r();
 	u8 port_c280_motion_r();
@@ -310,7 +311,10 @@ private:
 	u8 m_display_segments = 0;
 	u8 m_display_memory[6]{};
 	u8 m_key_column_select = 0;
-	u8 m_sonar_count = 134;
+	u8 m_sonar_count = 134;            // aperture "world" byte: the count the next echo will latch
+	u8 m_sonar_counter = 134;          // modeled U313 CPU-visible byte at rest (latched/cleared)
+	bool m_sonar_ping_active = false;  // U319C gate open: counting toward the echo/Q10 latch
+	attotime m_sonar_ping_start;       // transmit-pulse counter-reset instant (H1-TM p. 81)
 	u8 m_light_level = 50;
 	u8 m_sound_level = 0;
 	u8 m_motion_detected = 0;
@@ -380,6 +384,9 @@ void hero1_state::machine_start()
 	save_item(NAME(m_display_memory));
 	save_item(NAME(m_key_column_select));
 	save_item(NAME(m_sonar_count));
+	save_item(NAME(m_sonar_counter));
+	save_item(NAME(m_sonar_ping_active));
+	save_item(NAME(m_sonar_ping_start));
 	save_item(NAME(m_light_level));
 	save_item(NAME(m_sound_level));
 	save_item(NAME(m_motion_detected));
@@ -439,6 +446,9 @@ void hero1_state::machine_reset()
 		digit = 0;
 	m_key_column_select = 0;
 	m_sonar_count = 134;
+	m_sonar_counter = 134;
+	m_sonar_ping_active = false;
+	m_sonar_ping_start = attotime::zero;
 	m_light_level = 50;
 	m_sound_level = 0;
 	m_motion_detected = 0;
@@ -682,11 +692,27 @@ u8 hero1_state::port_c200_interrupt_r()
 	return m_interrupt_status;
 }
 
+// Raw U313 count while the U319C gate is open: 32.768 kHz periods since the
+// transmit-pulse reset (H1-TM printed p. 81 — "The count always begins from
+// zero"), clamped to the 12-stage width.
+u32 hero1_state::live_sonar_raw_count() const
+{
+	const attotime elapsed = machine().time() - m_sonar_ping_start;
+	const u64 raw = elapsed.as_ticks(32768);
+	return u32(raw > 0x0fff ? 0x0fff : raw);
+}
+
 u8 hero1_state::port_c220_sonar_r()
 {
-	// ET-18 sheet 3 reads U313 counter bits Q2-Q9 through U312 onto D0-D7.
-	// The bridge converts the panel's inch value into this readable count byte.
-	return m_sonar_count;
+	// ET-18 sheet 3 reads U313 counter bits Q2-Q9 through U312 onto D0-D7,
+	// i.e. floor(raw/2) — 61.035 us per byte step at the 32.768 kHz RTC
+	// reference (H1-TM printed p. 81). While a ping is in flight the byte
+	// is the LIVE count; after the echo (or the Q10 max-range latch) stops
+	// the gate it holds the latched value. The bridge aperture supplies the
+	// world distance the next echo will latch, not this register.
+	if (m_sonar_ping_active)
+		return u8((live_sonar_raw_count() >> 1) & 0xff);
+	return m_sonar_counter;
 }
 
 u8 hero1_state::port_c240_sense_r()
@@ -749,7 +775,16 @@ void hero1_state::sensor_w(offs_t offset, u8 data)
 		// Debug-aperture echo event: a new counter byte models "an echo
 		// arrived with this reading", which is exactly what clocks the
 		// SONAR flip-flop ($01) on hardware (U323B -> U408A, spec §1.8).
+		// If a ping is in flight this IS that ping's echo (one latch; the
+		// pending gate-window timer is superseded); otherwise it is a
+		// free-standing injected echo, as before.
 		m_sonar_count = data;
+		m_sonar_counter = data;
+		if (m_sonar_ping_active)
+		{
+			m_sonar_ping_active = false;
+			m_sonar_timer->adjust(attotime::never);
+		}
 		latch_interrupt(0x01);
 		break;
 	case 0x01:
@@ -815,6 +850,14 @@ void hero1_state::port_c200_control_w(u8 data)
 	// manual erratum (hero-1-motion-spec.md §1.8, blessing 2026-07-06).
 	m_interrupt_clear_latch = data;
 	m_interrupt_status &= data;
+	// The $01 clear line is also the ranging-counter clear (H1-TM printed
+	// p. 81: after reading $C220 the CPU sends a clear along P304 pin 33 —
+	// "Like the transmit pulse, this resets counter U313 and output
+	// flip-flop U318"). Reset the at-rest latched byte; a ping in flight is
+	// untouched (firmware only clears after sonar-ready, never mid-count —
+	// the RL enable handler's settle delay outlasts every ping).
+	if (!BIT(data, 0) && !m_sonar_ping_active)
+		m_sonar_counter = 0;
 	update_irq_line();
 }
 
@@ -921,14 +964,36 @@ void hero1_state::port_c2e0_system_select_w(u8 data)
 	}
 	if (!previous_sonar_power && BIT(data, 1))
 	{
-		// Powering the sonar starts a ping; the echo event latches $01
-		// when the modeled round trip elapses. Power changes never touch
-		// the interrupt flip-flops themselves (spec §1.8; the old stub's
-		// "&= ~$10" here belonged to its inverted $01/$10 pairing).
-		m_sonar_timer->adjust(attotime::from_ticks(u64(m_sonar_count) * 13500 + 1, 32768 * 45000));
+		// Powering the sonar starts a ping: the transmit pulse resets
+		// 12-stage counter U313 and gates the 32.768 kHz RTC reference
+		// (Y301 via U315 pin 17, buffered U317F) into it — "The count
+		// always begins from zero" (H1-TM printed p. 81). The echo stops
+		// the gate when the counter reaches the aperture distance's raw
+		// count: byte N = Q2-Q9 = floor(raw/2), so the echo lands
+		// mid-window at raw 2N+1 — 61.035 us per counter-byte step, the
+		// crystal-derived relation (R4 remediation 2026-07-13; the old
+		// ~9.16 us/step constant returned echoes ~6.7x early). Aperture
+		// byte 0 models "no echo within range": U313 Q10 goes high FIRST
+		// at raw 512 (15.625 ms) and sets the U319A/U319D max-range latch
+		// instead ("about 8 feet"). Power changes never touch the
+		// interrupt flip-flops themselves (spec §1.8).
+		m_sonar_ping_active = true;
+		m_sonar_ping_start = machine().time();
+		const u32 target_raw = (m_sonar_count != 0) ? (u32(m_sonar_count) * 2 + 1) : 512;
+		m_sonar_timer->adjust(attotime::from_ticks(target_raw, 32768));
 	}
 	else if (previous_sonar_power && !BIT(data, 1))
 	{
+		// Power off mid-flight: the transmit/receive boards lose power, so
+		// no echo can return; the modeled gate freezes at the live count
+		// without raising sonar-ready. Firmware never disables inside a
+		// flight — the RL enable handler's own settle delay ($E0FB,
+		// 4096x8 cycles) outlasts the longest 15.625 ms ping.
+		if (m_sonar_ping_active)
+		{
+			m_sonar_counter = u8((live_sonar_raw_count() >> 1) & 0xff);
+			m_sonar_ping_active = false;
+		}
 		m_sonar_timer->adjust(attotime::never);
 	}
 }
@@ -1181,7 +1246,12 @@ TIMER_CALLBACK_MEMBER(hero1_state::executive_timer_tick)
 
 TIMER_CALLBACK_MEMBER(hero1_state::sonar_echo_tick)
 {
-	// SONAR (U408A): the range-counter echo latch fires once per ping.
+	// SONAR (U408A): the echo — or the Q10 max-range latch for aperture
+	// byte 0 — fires once per ping and stops the U319C gate; $C220 then
+	// holds the latched byte (raw 2N+1 reads N; the Q10 latch at raw 512
+	// reads 0, which the v1.3/v1.U ISR wraps to $FF at $FF09).
+	m_sonar_ping_active = false;
+	m_sonar_counter = m_sonar_count;
 	latch_interrupt(0x01);
 }
 
