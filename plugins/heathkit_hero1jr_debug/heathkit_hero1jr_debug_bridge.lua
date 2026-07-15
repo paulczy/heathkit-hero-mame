@@ -2199,7 +2199,12 @@ local handlers = {
 -- built, so hosts can correlate command effects with machine time.
 local function send_response(client, response)
   response.emulatedTimeSeconds = emulated_time_seconds()
-  return pcall(send_line, client, response)
+  trace("response #" .. tostring(response.id) .. " constructed ok=" .. tostring(response.ok)
+    .. " pc=" .. trace_address(get_register("pc")))
+  local sent, result = pcall(send_line, client, response)
+  trace("response #" .. tostring(response.id) .. " socket send "
+    .. (sent and "complete" or ("failed: " .. tostring(result))))
+  return sent, result
 end
 
 -- Returns false when the client's socket is no longer writable (the caller
@@ -2220,7 +2225,12 @@ local function handle_request(client, line)
   end
 
   trace("request #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " pc=" .. trace_address(get_register("pc")))
+  trace("handler enter #" .. tostring(request.id) .. " " .. tostring(request.cmd)
+    .. " emulated=" .. tostring(emulated_time_seconds()))
   local success, result = xpcall(function() return handler(request.params or {}) end, debug.traceback)
+  trace("handler exit #" .. tostring(request.id) .. " " .. tostring(request.cmd)
+    .. " success=" .. tostring(success) .. " deferred=" .. tostring(result == DEFER_RESPONSE)
+    .. " emulated=" .. tostring(emulated_time_seconds()))
   if success then
     if result == DEFER_RESPONSE then
       if pending_key_release and not pending_key_release.claimed then
@@ -2244,7 +2254,7 @@ local function handle_request(client, line)
       trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " deferred until the reset completes")
       return true
     end
-    trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " ok")
+    trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd) .. " ready for construction")
     return send_response(client, { id = request.id or json_null, ok = true, result = result or {} })
   end
 
