@@ -725,7 +725,12 @@ u8 hero1_state::port_c240_sense_r()
 	// ET-18 sense board: C240 reads the 8-bit ADC output. The sound/light
 	// select line chooses which analog source reaches the ADC; the port map
 	// labels C2E0 bit 7 as EYE/EAR select, and the sense-board text says high
-	// selects light while low selects sound.
+	// selects light while low selects sound. C2E0 D5 switches the board rail
+	// through Q602/Q601 (H1-SCH1). With that rail off, ADC U602 is unpowered
+	// and its D0-D7 lines feed always-powered U303 without pull-downs
+	// (H1-SCH3), so the TTL input path reads high.
+	if (!BIT(m_manual_port_out[7], 5))
+		return 0xff;
 	return BIT(m_manual_port_out[7], 7) ? m_light_level : m_sound_level;
 }
 
@@ -777,20 +782,12 @@ void hero1_state::sensor_w(offs_t offset, u8 data)
 	switch (offset & 0x0f)
 	{
 	case 0x00:
-		// Debug-aperture echo event: a new counter byte models "an echo
-		// arrived with this reading", which is exactly what clocks the
-		// SONAR flip-flop ($01) on hardware (U323B -> U408A, spec §1.8).
-		// If a ping is in flight this IS that ping's echo (one latch; the
-		// pending gate-window timer is superseded); otherwise it is a
-		// free-standing injected echo, as before.
+		// Environmental distance target only. The debug aperture is not an
+		// echo wire: only a powered transmit cycle starts U313, and only its
+		// scheduled echo/Q10 event stops the gate, latches $C220, and clocks
+		// the SONAR flip-flop (U323B -> U408A). Updating the world while a
+		// ping is in flight affects the next ping, never the current flight.
 		m_sonar_count = data;
-		m_sonar_counter = data;
-		if (m_sonar_ping_active)
-		{
-			m_sonar_ping_active = false;
-			m_sonar_timer->adjust(attotime::never);
-		}
-		latch_interrupt(0x01);
 		break;
 	case 0x01:
 		m_light_level = data;
@@ -804,7 +801,10 @@ void hero1_state::sensor_w(offs_t offset, u8 data)
 		// one latched event per detector off->on transition. Deasserting
 		// the aperture never clears the flip-flop — only U411 does.
 		const u8 detected = data ? 1 : 0;
-		if (detected && !m_motion_detected)
+		// H1-TM p. 78: Q1404/Q1403 switch power to the detector board
+		// from U311 D2. Preserve the environmental state while unpowered,
+		// but no board output edge exists to clock U408B until power is on.
+		if (detected && !m_motion_detected && BIT(m_manual_port_out[7], 2))
 			latch_interrupt(0x02);
 		m_motion_detected = detected;
 		m_motion = m_motion_detected;
@@ -1266,6 +1266,9 @@ TIMER_CALLBACK_MEMBER(hero1_state::executive_timer_tick)
 // distance's raw count on the 32.768 kHz reference.
 void hero1_state::start_sonar_ping()
 {
+	if (!BIT(m_manual_port_out[7], 1))
+		return;
+
 	m_sonar_ping_active = true;
 	m_sonar_ping_start = machine().time();
 	const u32 target_raw = (m_sonar_count != 0) ? (u32(m_sonar_count) * 2 + 1) : 512;
@@ -1278,6 +1281,9 @@ TIMER_CALLBACK_MEMBER(hero1_state::sonar_echo_tick)
 	// byte 0 — fires once per ping and stops the U319C gate; $C220 then
 	// holds the latched byte (raw 2N+1 reads N; the Q10 latch at raw 512
 	// reads 0, which the v1.3/v1.U ISR wraps to $FF at $FF09).
+	if (!BIT(m_manual_port_out[7], 1) || !m_sonar_ping_active)
+		return;
+
 	m_sonar_ping_active = false;
 	m_sonar_counter = m_sonar_count;
 	latch_interrupt(0x01);
@@ -1288,7 +1294,8 @@ TIMER_CALLBACK_MEMBER(hero1_state::sonar_train_tick)
 	// Free-running transmit cycle while sonar power is on (H1-TM printed
 	// p. 76; nominal 0.25 s — see port_c2e0_system_select_w). Each burst
 	// starts a fresh ranging count against the resident world distance.
-	start_sonar_ping();
+	if (BIT(m_manual_port_out[7], 1))
+		start_sonar_ping();
 }
 
 void hero1_state::update_pendant_port(u8 data)
