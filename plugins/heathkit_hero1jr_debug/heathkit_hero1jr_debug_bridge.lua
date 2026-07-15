@@ -389,7 +389,8 @@ local reset_ack_stop_seen = false   -- genuine stop broadcast since reset_machin
 local DEFER_RESPONSE = {}           -- handler sentinel: the pump owns the response
 -- Key-pulse emulated-hold floor (R6, 2026-07-15). press_key stamps the press
 -- instant in EMULATED time; release_key defers its deassert + response until
--- the pulse has spanned >= KEY_HOLD_MIN_S of emulated time. Ioport
+-- the pulse has spanned the machine's minimum shipped client hold in
+-- emulated time. Ioport
 -- set_value only becomes CPU-visible at ioport frame_update, and the
 -- firmware keypad scan needs the held level across its own IRQ cadence — a
 -- client's host-time hold (extension/tests: press, sleep(400 ms), release)
@@ -404,10 +405,14 @@ local DEFER_RESPONSE = {}           -- handler sentinel: the pump owns the respo
 -- never complete (emulated time is frozen), so a client-visible stop
 -- releases immediately: pressing keys into a deliberately stopped machine
 -- keeps its old semantics, and a breakpoint landing mid-hold cannot
--- deadlock the acknowledgement. 100 ms >= six 60 Hz ioport samples plus
--- the firmware scan cadence, and sits under every shipped client hold
--- (>= 120 ms), so a healthy session never defers.
-local KEY_HOLD_MIN_S = 0.100
+-- deadlock the acknowledgement. The initial 100 ms floor was disproved by
+-- the required 30-session R6 bar: repetition 8 completed both RPCs exactly
+-- once but lost the HERO Jr dispatch key and produced a connected zero-byte
+-- session. Preserve the shortest product pulse instead: HERO Jr BASIC
+-- dispatch holds for 400 ms; HERO 1 monitor typing holds for 120 ms. Healthy
+-- sessions normally accrue that emulated time during the client's host hold,
+-- while a starved session makes up only the missing emulated interval.
+local KEY_HOLD_MIN_S = { hero1 = 0.120, herojr = 0.400 }
 local key_press_at = {}             -- key -> emulated press instant
 local pending_key_release = nil     -- { key, release_at, client, id, claimed }
 local apply_key_release             -- assigned with the key handlers (forward declaration for drop_client)
@@ -1763,7 +1768,8 @@ local function release_key(params)
   if pressed_at
     and manager.machine.debugger
     and manager.machine.debugger.execution_state == "run" then
-    local release_at = pressed_at + KEY_HOLD_MIN_S
+    local hold_floor = KEY_HOLD_MIN_S[system_name()] or KEY_HOLD_MIN_S.hero1
+    local release_at = pressed_at + hold_floor
     if emulated_time_seconds() < release_at then
       if pending_key_release then
         -- Unreachable for a request/await client; answer a superseded
