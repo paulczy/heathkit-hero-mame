@@ -30,7 +30,12 @@ public:
 	virtual bool is_writeable() const noexcept override { return !m_is_readonly; }
 	virtual bool is_creatable() const noexcept override { return !m_is_readonly; }
 	virtual bool is_reset_on_load() const noexcept override { return false; }
-	virtual bool support_command_line_image_creation() const noexcept override { return !m_is_readonly; }
+	// Heathkit HERO fork (R6): never fall back to CREATE for a startup
+	// -bitb mount. For a socket path CREATE means bind+listen, so a failed
+	// connect silently turned MAME into a byteless second listener on the
+	// port (one lost stderr line, no error). With creation refused, a mount
+	// failure is a fatal device-load error the session cannot hide.
+	virtual bool support_command_line_image_creation() const noexcept override { return false; }
 	virtual const char *image_interface() const noexcept override { return m_interface; }
 	virtual const char *file_extensions() const noexcept override { return ""; }
 	virtual const char *image_type_name() const noexcept override { return "bitbanger"; }

@@ -387,6 +387,30 @@ local machine_reset_baseline = 0    -- count captured when the reset was request
 local herojr_reset_respond_at = nil -- emulated instant the release is provably sampled
 local reset_ack_stop_seen = false   -- genuine stop broadcast since reset_machine
 local DEFER_RESPONSE = {}           -- handler sentinel: the pump owns the response
+-- Key-pulse emulated-hold floor (R6, 2026-07-15). press_key stamps the press
+-- instant in EMULATED time; release_key defers its deassert + response until
+-- the pulse has spanned >= KEY_HOLD_MIN_S of emulated time. Ioport
+-- set_value only becomes CPU-visible at ioport frame_update, and the
+-- firmware keypad scan needs the held level across its own IRQ cadence — a
+-- client's host-time hold (extension/tests: press, sleep(400 ms), release)
+-- contains no emulated samples while the process is starved or stalled, so
+-- the 0->1->0 pulse completed UNSAMPLED and the keypress was silently lost:
+-- the same lost-pulse mechanism as the reset engage window above, observed
+-- in the wild as byteless BASIC sessions (dispatch key 1 swallowed at the
+-- monitor -> zero RS-232 bytes on a healthy socket; G3-05 reds 2026-07-12 +
+-- R5B GATE2, G2J-06 red R5C GATE2). Deterministic both directions:
+-- conformance/tools/reproR6KeySwallow.ts (NtSuspendProcess starvation
+-- analog). While the debugger has the machine stopped a deferral could
+-- never complete (emulated time is frozen), so a client-visible stop
+-- releases immediately: pressing keys into a deliberately stopped machine
+-- keeps its old semantics, and a breakpoint landing mid-hold cannot
+-- deadlock the acknowledgement. 100 ms >= six 60 Hz ioport samples plus
+-- the firmware scan cadence, and sits under every shipped client hold
+-- (>= 120 ms), so a healthy session never defers.
+local KEY_HOLD_MIN_S = 0.100
+local key_press_at = {}             -- key -> emulated press instant
+local pending_key_release = nil     -- { key, release_at, client, id, claimed }
+local apply_key_release             -- assigned with the key handlers (forward declaration for drop_client)
 local supported_commands = {
   "get_capabilities",
   "get_registers",
@@ -787,6 +811,14 @@ local drop_framing_state
 local function drop_client(client)
   if pending_reset_ack and pending_reset_ack.client == client then
     pending_reset_ack = nil
+  end
+  if pending_key_release and pending_key_release.claimed and pending_key_release.client == client then
+    -- Never leave the key stuck down for a vanished client.
+    local stuck = pending_key_release
+    pending_key_release = nil
+    if apply_key_release then
+      apply_key_release(stuck.key)
+    end
   end
   pcall(function() client:close() end)
   receive_buffers[client] = nil
@@ -1680,6 +1712,7 @@ end
 local function press_key(params)
   local key = assert(params.key, "press_key requires key")
   keypad_state[key] = true
+  key_press_at[key] = emulated_time_seconds()
   local mapping = system_name() == "hero1" and key_map[key] or nil
   if mapping then
     keypad_columns[mapping.column] = keypad_columns[mapping.column] & (~mapping.bit & 0x3f)
@@ -1699,8 +1732,9 @@ local function press_key(params)
   return {}
 end
 
-local function release_key(params)
-  local key = assert(params.key, "release_key requires key")
+-- The deassert half of a key pulse; shared by the immediate release path,
+-- the pump's deferred-release completion, and drop_client's stuck-key guard.
+apply_key_release = function(key)
   keypad_state[key] = nil
   local mapping = system_name() == "hero1" and key_map[key] or nil
   if mapping then
@@ -1715,6 +1749,41 @@ local function release_key(params)
     end
   end
   broadcast_io_changed(true)
+end
+
+local function release_key(params)
+  local key = assert(params.key, "release_key requires key")
+  local pressed_at = key_press_at[key]
+  key_press_at[key] = nil
+  -- Emulated-hold floor (see KEY_HOLD_MIN_S): while the machine is RUNNING,
+  -- the deassert may not land before the press has provably spanned the
+  -- ioport/firmware sampling cadence. A stopped machine (client-visible
+  -- debugger state) releases immediately — emulated time cannot advance, so
+  -- deferring would deadlock, and the client explicitly owns that state.
+  if pressed_at
+    and manager.machine.debugger
+    and manager.machine.debugger.execution_state == "run" then
+    local release_at = pressed_at + KEY_HOLD_MIN_S
+    if emulated_time_seconds() < release_at then
+      if pending_key_release then
+        -- Unreachable for a request/await client; answer a superseded
+        -- release honestly rather than orphaning its id.
+        local stale = pending_key_release
+        pending_key_release = nil
+        apply_key_release(stale.key)
+        if stale.claimed then
+          send_response(stale.client, {
+            id = stale.id,
+            ok = false,
+            error = "superseded by a newer release_key"
+          })
+        end
+      end
+      pending_key_release = { key = key, release_at = release_at, claimed = false }
+      return DEFER_RESPONSE
+    end
+  end
+  apply_key_release(key)
   return {}
 end
 
@@ -2154,6 +2223,14 @@ local function handle_request(client, line)
   local success, result = xpcall(function() return handler(request.params or {}) end, debug.traceback)
   if success then
     if result == DEFER_RESPONSE then
+      if pending_key_release and not pending_key_release.claimed then
+        pending_key_release.client = client
+        pending_key_release.id = request.id or json_null
+        pending_key_release.claimed = true
+        trace("response #" .. tostring(request.id) .. " " .. tostring(request.cmd)
+          .. " deferred until the key hold reaches the emulated sampling floor")
+        return true
+      end
       if pending_reset_ack then
         -- Unreachable for a request/await client; answer a superseded
         -- reset honestly rather than orphaning its id.
@@ -2472,6 +2549,24 @@ local function poll()
       pending_reset_ack = nil
       herojr_reset_respond_at = nil
       trace("response #" .. tostring(ack.id) .. " reset_machine ok (deferred until the reset completed)")
+      if not send_response(ack.client, { id = ack.id, ok = true, result = {} }) then
+        drop_client(ack.client)
+      end
+    end
+  end
+
+  -- Flush a deferred release_key once the press has spanned the emulated
+  -- sampling floor (see KEY_HOLD_MIN_S). A client-visible debugger stop
+  -- releases immediately: emulated time is frozen there, and the stop is
+  -- the client's own doing (breakpoint mid-hold or explicit pause).
+  if pending_key_release and pending_key_release.claimed then
+    local stopped = manager.machine.debugger and manager.machine.debugger.execution_state == "stop"
+    if stopped or emulated_time_seconds() >= pending_key_release.release_at then
+      local ack = pending_key_release
+      pending_key_release = nil
+      apply_key_release(ack.key)
+      trace("response #" .. tostring(ack.id) .. " release_key ok (deferred until the emulated hold floor"
+        .. (stopped and "; released at a client-visible stop" or "") .. ")")
       if not send_response(ack.client, { id = ack.id, ok = true, result = {} }) then
         drop_client(ack.client)
       end

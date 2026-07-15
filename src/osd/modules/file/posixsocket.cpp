@@ -11,10 +11,14 @@
 
 #include "posixfile.h"
 
+#include "osdcore.h"
+
 #include <cassert>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -148,8 +152,8 @@ private:
 };
 
 
-template <typename T>
-std::error_condition create_socket(T const &sa, int sock, std::uint32_t openflags, osd_file::ptr &file, std::uint64_t &filesize) noexcept
+template <typename T, typename MakeSocket>
+std::error_condition create_socket(T const &sa, int sock, std::uint32_t openflags, osd_file::ptr &file, std::uint64_t &filesize, MakeSocket &&make_socket) noexcept
 {
 	osd_file::ptr result;
 	if (openflags & OPEN_FLAG_CREATE)
@@ -176,11 +180,46 @@ std::error_condition create_socket(T const &sa, int sock, std::uint32_t openflag
 	}
 	else
 	{
-		if (::connect(sock, reinterpret_cast<struct sockaddr const *>(&sa), sizeof(sa)) < 0)
+		// Heathkit HERO fork (R6): a client socket connect gets a bounded
+		// (deadline-based: refusal latency is host-dependent — some filter
+		// drivers hold a loopback RST for ~2 s) retry with backoff. A single
+		// attempt turned a transiently refused/late peer (the harness serial
+		// listener) into a permanently byteless null_modem session via the
+		// image manager's silent CREATE fallback. After the budget the
+		// failure is loud and carries the real error.
+		constexpr std::int64_t CONNECT_RETRY_BUDGET_NS = 10'000'000'000;
+		constexpr useconds_t CONNECT_RETRY_DELAY_US = 250'000;
+		auto const monotonic_ns = [] () -> std::int64_t
 		{
-			std::error_condition connerr(errno, std::generic_category());
+			struct timespec ts;
+			::clock_gettime(CLOCK_MONOTONIC, &ts);
+			return (std::int64_t(ts.tv_sec) * 1'000'000'000) + ts.tv_nsec;
+		};
+		std::int64_t const retry_deadline = monotonic_ns() + CONNECT_RETRY_BUDGET_NS;
+		int attempt = 0;
+		for (;;)
+		{
+			if (::connect(sock, reinterpret_cast<struct sockaddr const *>(&sa), sizeof(sa)) >= 0)
+				break;
+			int const err = errno;
 			::close(sock);
-			return connerr;
+			++attempt;
+			bool const retryable =
+					(ECONNREFUSED == err) ||
+					(ETIMEDOUT == err) ||
+					(EADDRINUSE == err) ||
+					(ENETUNREACH == err) ||
+					(EHOSTUNREACH == err);
+			if (!retryable || (monotonic_ns() >= retry_deadline))
+			{
+				std::error_condition const connerr(err, std::generic_category());
+				osd_printf_error("Socket connect failed after %1$d attempt(s): %2$s\n", attempt, connerr.message());
+				return connerr;
+			}
+			::usleep(CONNECT_RETRY_DELAY_US);
+			sock = make_socket();
+			if (sock < 0)
+				return std::error_condition(errno, std::generic_category());
 		}
 		result.reset(new (std::nothrow) posix_osd_socket(sock, false));
 	}
@@ -235,20 +274,28 @@ std::error_condition posix_open_socket(std::string const &path, std::uint32_t op
 	sai.sin_port = htons(port);
 	sai.sin_addr = *reinterpret_cast<struct in_addr *>(localhost->h_addr);
 
-	int const sock = ::socket(AF_INET, SOCK_STREAM, 0);
+	auto const make_socket = [] () -> int
+	{
+		int const s = ::socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0)
+			return -1;
+		int const flag = 1;
+		if ((::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&flag), sizeof(flag)) < 0) ||
+			(::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&flag), sizeof(flag)) < 0))
+		{
+			int const sockopterr = errno;
+			::close(s);
+			errno = sockopterr;
+			return -1;
+		}
+		return s;
+	};
+
+	int const sock = make_socket();
 	if (sock < 0)
 		return std::error_condition(errno, std::generic_category());
 
-	int const flag = 1;
-	if ((::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&flag), sizeof(flag)) < 0) ||
-		(::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&flag), sizeof(flag)) < 0))
-	{
-		std::error_condition sockopterr(errno, std::generic_category());
-		::close(sock);
-		return sockopterr;
-	}
-
-	return create_socket(sai, sock, openflags, file, filesize);
+	return create_socket(sai, sock, openflags, file, filesize, make_socket);
 }
 
 
@@ -259,16 +306,24 @@ std::error_condition posix_open_domain(std::string const &path, std::uint32_t op
 	sau.sun_family = AF_UNIX;
 	strncpy(sau.sun_path, &path.c_str()[strlen(posixfile_domain_identifier)], sizeof(sau.sun_path)-1);
 
-	int const sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
+	auto const make_socket = [] () -> int
+	{
+		int const s = ::socket(AF_UNIX, SOCK_STREAM, 0);
+		if (s < 0)
+			return -1;
+		if (fcntl(s, F_SETFL, O_NONBLOCK) < 0)
+		{
+			int const cntlerr = errno;
+			::close(s);
+			errno = cntlerr;
+			return -1;
+		}
+		return s;
+	};
+
+	int const sock = make_socket();
 	if (sock < 0)
 		return std::error_condition(errno, std::generic_category());
 
-	if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0)
-	{
-		std::error_condition cntlerr(errno, std::generic_category());
-		::close(sock);
-		return cntlerr;
-	}
-
-	return create_socket(sau, sock, openflags, file, filesize);
+	return create_socket(sau, sock, openflags, file, filesize, make_socket);
 }

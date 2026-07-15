@@ -238,17 +238,23 @@ std::error_condition win_open_socket(std::string const &path, std::uint32_t open
 	sai.sin_port = htons(port);
 	sai.sin_addr = *reinterpret_cast<struct in_addr *>(localhost->h_addr);
 
-	SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+	auto const make_socket = [] () -> SOCKET
+	{
+		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+		if (INVALID_SOCKET == s)
+			return INVALID_SOCKET;
+		int const flag = 1;
+		if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&flag), sizeof(flag)) == SOCKET_ERROR)
+		{
+			closesocket(s);
+			return INVALID_SOCKET;
+		}
+		return s;
+	};
+
+	SOCKET sock = make_socket();
 	if (INVALID_SOCKET == sock)
 		return win_osd_socket::wsa_error_to_file_error(WSAGetLastError());
-
-	int const flag = 1;
-	if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&flag), sizeof(flag)) == SOCKET_ERROR)
-	{
-		int const err = WSAGetLastError();
-		closesocket(sock);
-		return win_osd_socket::wsa_error_to_file_error(err);
-	}
 
 	// listening socket support
 	osd_file::ptr result;
@@ -276,12 +282,42 @@ std::error_condition win_open_socket(std::string const &path, std::uint32_t open
 	}
 	else
 	{
-		//printf("Connecting to server '%s' on port '%d'\n", hostname, port);
-		if (connect(sock, reinterpret_cast<struct sockaddr const *>(&sai), sizeof(sai)) == SOCKET_ERROR)
+		// Heathkit HERO fork (R6): a client socket connect gets a bounded
+		// (deadline-based: refusal latency is host-dependent — some filter
+		// drivers hold a loopback RST for ~2 s) retry with backoff. A single
+		// attempt turned a transiently refused/late peer (the harness serial
+		// listener) into a permanently byteless null_modem session via the
+		// image manager's silent CREATE fallback. After the budget the
+		// failure is loud and carries the real error.
+		constexpr ULONGLONG CONNECT_RETRY_BUDGET_MS = 10'000;
+		constexpr DWORD CONNECT_RETRY_DELAY_MS = 250;
+		ULONGLONG const retry_deadline = GetTickCount64() + CONNECT_RETRY_BUDGET_MS;
+		int attempt = 0;
+		for (;;)
 		{
+			if (connect(sock, reinterpret_cast<struct sockaddr const *>(&sai), sizeof(sai)) != SOCKET_ERROR)
+				break;
 			int const err = WSAGetLastError();
 			closesocket(sock);
-			return win_osd_socket::wsa_error_to_file_error(err);
+			++attempt;
+			bool const retryable =
+					(WSAECONNREFUSED == err) ||
+					(WSAETIMEDOUT == err) ||
+					(WSAEADDRINUSE == err) ||
+					(WSAENETUNREACH == err) ||
+					(WSAEHOSTUNREACH == err);
+			if (!retryable || (GetTickCount64() >= retry_deadline))
+			{
+				osd_printf_error(
+						"Socket connect to %1$s:%2$d failed after %3$d attempt(s): %4$s\n",
+						hostname, port, attempt,
+						win_osd_socket::wsa_error_to_file_error(err).message());
+				return win_osd_socket::wsa_error_to_file_error(err);
+			}
+			Sleep(CONNECT_RETRY_DELAY_MS);
+			sock = make_socket();
+			if (INVALID_SOCKET == sock)
+				return win_osd_socket::wsa_error_to_file_error(WSAGetLastError());
 		}
 		result.reset(new (std::nothrow) win_osd_socket(sock, false));
 	}
