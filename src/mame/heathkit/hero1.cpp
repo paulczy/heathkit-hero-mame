@@ -11,7 +11,7 @@
     - System ROM decoded at E000-FFFF on expanded systems
     - BASIC expansion ROM image decoded at A000-BFFF when present
     - Decoded I/O ports at C200-C300, plus internal 6821 PIA-style scaffolds
-    - 6850 ACIA cassette/serial-style interface
+- CPU-board cassette conditioning plus Experimental Board bit-banged serial
     - 6 seven-segment LED digits
     - 17-key keypad
     - Sonar/light/sound/motion sensors
@@ -32,9 +32,9 @@
 
 #include "cpu/m6800/m6800.h"
 #include "machine/6821pia.h"
-#include "machine/6850acia.h"
-#include "machine/clock.h"
 #include "machine/msm5832.h"
+#include "bus/generic/carts.h"
+#include "bus/generic/slot.h"
 #include "bus/rs232/rs232.h"
 #include "sound/votrax.h"
 
@@ -42,9 +42,148 @@
 #include "speaker.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <utility>
 
+
+class hero1_memory_card_interface : public device_interface
+{
+public:
+	virtual u8 read(offs_t offset) { return 0xff; }
+	virtual void write(offs_t offset, u8 data) { }
+
+protected:
+	hero1_memory_card_interface(const machine_config &mconfig, device_t &device) :
+		device_interface(device, "hero1memory")
+	{
+	}
+};
+
+class hero1_memory_socket_device : public device_t,
+	public device_single_card_slot_interface<hero1_memory_card_interface>
+{
+public:
+	template <typename T>
+	hero1_memory_socket_device(const machine_config &mconfig, const char *tag, device_t *owner, T &&options) :
+		hero1_memory_socket_device(mconfig, tag, owner, u32(0))
+	{
+		set_options(std::forward<T>(options), nullptr, false);
+	}
+
+	hero1_memory_socket_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
+
+	u8 read(offs_t offset) { return m_card ? m_card->read(offset) : 0xff; }
+	void write(offs_t offset, u8 data) { if (m_card) m_card->write(offset, data); }
+
+protected:
+	virtual void device_start() override ATTR_COLD { m_card = get_card_device(); }
+
+private:
+	hero1_memory_card_interface *m_card = nullptr;
+};
+
+class hero1_ram_device : public device_t, public hero1_memory_card_interface
+{
+protected:
+	hero1_ram_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, u32 size) :
+		device_t(mconfig, type, tag, owner, 0),
+		hero1_memory_card_interface(mconfig, *this),
+		m_size(size)
+	{
+	}
+
+	virtual void device_start() override ATTR_COLD
+	{
+		std::fill(m_ram.begin(), m_ram.end(), 0x00);
+		save_item(NAME(m_ram));
+	}
+
+	virtual u8 read(offs_t offset) override { return m_ram[offset & (m_size - 1)]; }
+	virtual void write(offs_t offset, u8 data) override { m_ram[offset & (m_size - 1)] = data; }
+
+private:
+	const u32 m_size;
+	std::array<u8, 0x2000> m_ram{};
+};
+
+class hero1_ram6116_device : public hero1_ram_device
+{
+public:
+	hero1_ram6116_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock);
+};
+
+class hero1_ram6264_device : public hero1_ram_device
+{
+public:
+	hero1_ram6264_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock);
+};
+
+class hero1_rom_device : public device_t, public hero1_memory_card_interface
+{
+public:
+	hero1_rom_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock);
+
+protected:
+	virtual void device_add_mconfig(machine_config &config) override ATTR_COLD
+	{
+		// Prepared socket images are laid out from the socket base. Bytes not
+		// present in a partial dump (notably BASIC's $A000-$B743 payload) read
+		// erased/open high rather than wrapping at a non-chip-size boundary.
+		GENERIC_SOCKET(config, m_image, generic_plain_slot, "hero1_expansion", "bin,rom");
+	}
+	virtual void device_start() override ATTR_COLD { }
+	virtual u8 read(offs_t offset) override { return m_image->exists() ? m_image->read_rom(offset) : 0xff; }
+
+private:
+	required_device<generic_slot_device> m_image;
+};
+
+DECLARE_DEVICE_TYPE(HERO1_MEMORY_SOCKET, hero1_memory_socket_device)
+DECLARE_DEVICE_TYPE(HERO1_RAM6116, hero1_ram6116_device)
+DECLARE_DEVICE_TYPE(HERO1_RAM6264, hero1_ram6264_device)
+DECLARE_DEVICE_TYPE(HERO1_ROM, hero1_rom_device)
+
+DEFINE_DEVICE_TYPE(HERO1_MEMORY_SOCKET, hero1_memory_socket_device, "hero1_memory_socket", "HERO 1 ET-18-6 memory socket")
+DEFINE_DEVICE_TYPE(HERO1_RAM6116, hero1_ram6116_device, "hero1_6116", "HERO 1 6116 RAM")
+DEFINE_DEVICE_TYPE(HERO1_RAM6264, hero1_ram6264_device, "hero1_6264", "HERO 1 6264 RAM")
+DEFINE_DEVICE_TYPE(HERO1_ROM, hero1_rom_device, "hero1_rom", "HERO 1 expansion ROM")
+
+hero1_memory_socket_device::hero1_memory_socket_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock) :
+	device_t(mconfig, HERO1_MEMORY_SOCKET, tag, owner, clock),
+	device_single_card_slot_interface<hero1_memory_card_interface>(mconfig, *this)
+{
+}
+
+hero1_ram6116_device::hero1_ram6116_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock) :
+	hero1_ram_device(mconfig, HERO1_RAM6116, tag, owner, 0x0800)
+{
+}
+
+hero1_ram6264_device::hero1_ram6264_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock) :
+	hero1_ram_device(mconfig, HERO1_RAM6264, tag, owner, 0x2000)
+{
+}
+
+hero1_rom_device::hero1_rom_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock) :
+	device_t(mconfig, HERO1_ROM, tag, owner, clock),
+	hero1_memory_card_interface(mconfig, *this),
+	m_image(*this, "rom")
+{
+}
+
+void hero1_u102_memory_devices(device_slot_interface &device)
+{
+	device.option_add("6116", HERO1_RAM6116);
+	device.option_add("rom", HERO1_ROM);
+}
+
+void hero1_u103_u107_memory_devices(device_slot_interface &device)
+{
+	device.option_add("6116", HERO1_RAM6116);
+	device.option_add("6264", HERO1_RAM6264);
+	device.option_add("rom", HERO1_ROM);
+}
 
 namespace {
 
@@ -66,11 +205,12 @@ public:
 	hero1_state(const machine_config &mconfig, device_type type, const char *tag) :
 		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
+		m_base_ram(*this, "base_ram"),
+		m_expansion(*this, "u10%u", 2U),
 		m_display_pia(*this, "display_pia"),
 		m_keypad_pia(*this, "keypad_pia"),
 		m_io_pia(*this, "io_pia"),
 		m_speech_pia(*this, "speech_pia"),
-		m_acia(*this, "acia"),
 		m_rs232(*this, "rs232"),
 		m_rtc(*this, "rtc"),
 		m_votrax(*this, "votrax"),
@@ -88,6 +228,11 @@ public:
 		m_phoneme_time_us(*this, "hero1_phoneme_time_us"),
 		m_phoneme_clips(*this, "hero1_phoneme_clips"),
 		m_motion(*this, "hero1_motion_detected"),
+		m_logic_sleep_out(*this, "hero1_logic_sleep_active"),
+		m_ram_write_protected_out(*this, "hero1_ram_write_protected"),
+		m_sleep_start_time_us_out(*this, "hero1_sleep_start_time_us"),
+		m_wake_time_us_out(*this, "hero1_wake_time_us"),
+		m_wake_count_out(*this, "hero1_wake_count"),
 		m_port_outputs(*this, "hero1_port_out_%u", 0U)
 	{
 	}
@@ -99,10 +244,9 @@ protected:
 	virtual void machine_reset() override ATTR_COLD;
 
 private:
-	static constexpr u16 HERO1_BASE_RAM_END = 0x1fff;
-	static constexpr u16 HERO1_EXPANSION_RAM_BASE = 0x4000;
-	static constexpr u16 HERO1_EXPANSION_RAM_END = 0x5fff;
-	static constexpr u16 HERO1_BASIC_ROM_BASE = 0xa000;
+	static constexpr u16 HERO1_BASE_RAM_END = 0x0fff;
+	static constexpr u16 HERO1_EXPANSION_BASE = 0x1000;
+	static constexpr u16 HERO1_EXPANSION_END = 0xbfff;
 	static constexpr u16 HERO1_DEBUG_IO_BASE = 0xd000;
 	static constexpr u16 HERO1_SENSOR_BASE = 0xd100;   // debug bridge aperture, not original hardware
 	static constexpr u16 HERO1_DEBUG_SPEECH_BASE = 0xd020;
@@ -200,6 +344,8 @@ private:
 	static constexpr double WHEEL_SPEED_DAC63_IN_PER_S = 10.0;
 
 	void mem_map(address_map &map) ATTR_COLD;
+	u8 expansion_r(offs_t offset);
+	void expansion_w(offs_t offset, u8 data);
 
 	u8 display_memory_r(offs_t offset);
 	void display_memory_w(offs_t offset, u8 data);
@@ -256,11 +402,14 @@ private:
 	void experimental_serial_rxd_w(int state);
 	void update_cpu_clock();
 	void update_speech_power();
+	void logic_sleep_begin();
 	TIMER_CALLBACK_MEMBER(executive_timer_tick);
 	TIMER_CALLBACK_MEMBER(sonar_echo_tick);
 	TIMER_CALLBACK_MEMBER(sonar_train_tick);
 	void start_sonar_ping();
 	TIMER_CALLBACK_MEMBER(wheel_pulse_tick);
+	TIMER_CALLBACK_MEMBER(logic_sleep_wake_tick);
+	TIMER_CALLBACK_MEMBER(ram_write_enable_tick);
 
 	template <typename... FormatParams>
 	void driver_tracef(const char *format, FormatParams &&... args)
@@ -274,11 +423,12 @@ private:
 	}
 
 	required_device<m6808_cpu_device> m_maincpu;
+	required_shared_ptr<u8> m_base_ram;
+	required_device_array<hero1_memory_socket_device, 6> m_expansion;
 	required_device<pia6821_device> m_display_pia;
 	required_device<pia6821_device> m_keypad_pia;
 	required_device<pia6821_device> m_io_pia;
 	required_device<pia6821_device> m_speech_pia;
-	required_device<acia6850_device> m_acia;
 	required_device<rs232_port_device> m_rs232;
 	required_device<msm5832_device> m_rtc;
 	required_device<votrax_sc01_device> m_votrax;
@@ -307,6 +457,11 @@ private:
 	}
 
 	output_finder<> m_motion;
+	output_finder<> m_logic_sleep_out;
+	output_finder<> m_ram_write_protected_out;
+	output_finder<> m_sleep_start_time_us_out;
+	output_finder<> m_wake_time_us_out;
+	output_finder<> m_wake_count_out;
 	output_finder<8> m_port_outputs;
 
 	u8 m_display_select = 0;
@@ -345,11 +500,21 @@ private:
 	u8 m_clock_control = 0;
 	u8 m_pendant_port = 0x8e;  // ET-18 teaching pendant read byte at $C280; idle ARM/N/released
 	u8 m_experimental_serial_rxd = 1;
+	u8 m_experimental_input = 0xff;
+	u8 m_experimental_irq_line = 1;
+	bool m_experimental_input_override = false;
+	bool m_logic_sleep_active = false;
+	bool m_ram_write_protected = false;
+	u32 m_wake_count = 0;
+	s32 m_sleep_start_time_us = 0;
+	s32 m_wake_time_us = 0;
 	bool m_driver_trace = false;
 	emu_timer *m_executive_timer = nullptr;
 	emu_timer *m_sonar_timer = nullptr;
 	emu_timer *m_sonar_train_timer = nullptr;
 	emu_timer *m_wheel_timer = nullptr;
+	emu_timer *m_logic_sleep_timer = nullptr;
+	emu_timer *m_ram_write_enable_timer = nullptr;
 };
 
 void hero1_state::machine_start()
@@ -380,6 +545,11 @@ void hero1_state::machine_start()
 	m_phoneme_time_us.resolve();
 	m_phoneme_clips.resolve();
 	m_motion.resolve();
+	m_logic_sleep_out.resolve();
+	m_ram_write_protected_out.resolve();
+	m_sleep_start_time_us_out.resolve();
+	m_wake_time_us_out.resolve();
+	m_wake_count_out.resolve();
 	m_port_outputs.resolve();
 
 	save_item(NAME(m_display_select));
@@ -418,7 +588,26 @@ void hero1_state::machine_start()
 	save_item(NAME(m_clock_control));
 	save_item(NAME(m_pendant_port));
 	save_item(NAME(m_experimental_serial_rxd));
+	save_item(NAME(m_experimental_input));
+	save_item(NAME(m_experimental_irq_line));
+	save_item(NAME(m_experimental_input_override));
+	save_item(NAME(m_logic_sleep_active));
+	save_item(NAME(m_ram_write_protected));
+	save_item(NAME(m_wake_count));
+	save_item(NAME(m_sleep_start_time_us));
+	save_item(NAME(m_wake_time_us));
 
+	// U322 holds the physical RAM R/W line high during main-logic sleep and
+	// for about 100 ms after U321 restores +5 V (H1-TM printed pp. 81-82;
+	// H1-SCH3).  A write tap lets CPU and debugger writes traverse the same
+	// driver-owned protection.  Replacing the bus data with the resident byte
+	// prevents the underlying RAM share from changing; reads remain live.
+	address_space &program = m_maincpu->space(AS_PROGRAM);
+	program.install_write_tap(0x0000, HERO1_BASE_RAM_END, "hero1_u322_base_ram", [this](offs_t offset, u8 &data, u8 mem_mask)
+	{
+		if (m_ram_write_protected)
+			data = m_base_ram[offset & HERO1_BASE_RAM_END];
+	});
 	// Mechanical pose is board state, not reset state (Jr steering
 	// precedent): seed the initialized pose the ROM's cold-boot path
 	// assumes — $FEE7 seeds rotate $4D, head $62, steering $49, others 0
@@ -439,11 +628,26 @@ void hero1_state::machine_start()
 	m_sonar_timer = timer_alloc(FUNC(hero1_state::sonar_echo_tick), this);
 	m_sonar_train_timer = timer_alloc(FUNC(hero1_state::sonar_train_tick), this);
 	m_wheel_timer = timer_alloc(FUNC(hero1_state::wheel_pulse_tick), this);
+	m_logic_sleep_timer = timer_alloc(FUNC(hero1_state::logic_sleep_wake_tick), this);
+	m_ram_write_enable_timer = timer_alloc(FUNC(hero1_state::ram_write_enable_tick), this);
 	driver_tracef("machine_start trace enabled");
 }
 
 void hero1_state::machine_reset()
 {
+	m_logic_sleep_active = false;
+	m_ram_write_protected = false;
+	m_wake_count = 0;
+	m_sleep_start_time_us = 0;
+	m_wake_time_us = 0;
+	m_logic_sleep_out = 0;
+	m_ram_write_protected_out = 0;
+	m_sleep_start_time_us_out = 0;
+	m_wake_time_us_out = 0;
+	m_wake_count_out = 0;
+	m_logic_sleep_timer->adjust(attotime::never);
+	m_ram_write_enable_timer->adjust(attotime::never);
+	m_maincpu->set_input_line(INPUT_LINE_RESET, CLEAR_LINE);
 	m_display_select = 0;
 	m_display_segments = 0;
 	for (u8 &digit : m_display_memory)
@@ -476,6 +680,9 @@ void hero1_state::machine_reset()
 	m_clock_control = 0;
 	m_pendant_port = 0x8e;
 	m_experimental_serial_rxd = 1;
+	m_experimental_input = 0xff;
+	m_experimental_irq_line = 1;
+	m_experimental_input_override = false;
 	m_rs232->write_txd(1);
 	m_speech_phoneme = 0;
 	driver_tracef("machine_reset pendant=$%02X speech_request=%u speech_power=%u", m_pendant_port, m_speech_request, m_speech_power);
@@ -523,8 +730,8 @@ void hero1_state::machine_reset()
 
 void hero1_state::mem_map(address_map &map)
 {
-	map(0x0000, HERO1_BASE_RAM_END).ram();
-	map(HERO1_EXPANSION_RAM_BASE, HERO1_EXPANSION_RAM_END).ram();
+	map(0x0000, HERO1_BASE_RAM_END).ram().share("base_ram");
+	map(HERO1_EXPANSION_BASE, HERO1_EXPANSION_END).rw(FUNC(hero1_state::expansion_r), FUNC(hero1_state::expansion_w));
 
 	map(0xc003, 0xc003).r(FUNC(hero1_state::keypad_column2_r));
 	map(0xc005, 0xc005).r(FUNC(hero1_state::keypad_column1_r));
@@ -542,17 +749,45 @@ void hero1_state::mem_map(address_map &map)
 	map(0xc2e0, 0xc2e0).w(FUNC(hero1_state::port_c2e0_system_select_w));
 	map(0xc300, 0xc300).rw(FUNC(hero1_state::port_c300_clock_r), FUNC(hero1_state::port_c300_clock_w));
 
-	// Debug aliases retained for deterministic extension smoke programs while board-level decode is completed.
+	// Internal PIA test apertures retained for deterministic extension smoke programs.
 	map(HERO1_DEBUG_IO_BASE + 0x00, HERO1_DEBUG_IO_BASE + 0x03).rw(m_display_pia, FUNC(pia6821_device::read), FUNC(pia6821_device::write));
 	map(HERO1_DEBUG_IO_BASE + 0x04, HERO1_DEBUG_IO_BASE + 0x07).rw(m_keypad_pia, FUNC(pia6821_device::read), FUNC(pia6821_device::write));
 	map(HERO1_DEBUG_IO_BASE + 0x08, HERO1_DEBUG_IO_BASE + 0x0b).rw(m_io_pia, FUNC(pia6821_device::read), FUNC(pia6821_device::write));
-	map(HERO1_DEBUG_IO_BASE + 0x10, HERO1_DEBUG_IO_BASE + 0x11).rw(m_acia, FUNC(acia6850_device::read), FUNC(acia6850_device::write));
 	map(HERO1_DEBUG_SPEECH_BASE + 0x00, HERO1_DEBUG_SPEECH_BASE + 0x03).rw(m_speech_pia, FUNC(pia6821_device::read), FUNC(pia6821_device::write));
 
 	map(HERO1_SENSOR_BASE + 0x00, HERO1_SENSOR_BASE + 0x0f).rw(FUNC(hero1_state::sensor_r), FUNC(hero1_state::sensor_w));
 
-	map(HERO1_BASIC_ROM_BASE, 0xbfff).rom().region("basic", 0);
 	map(HERO1_ROM_BASE, 0xffff).rom().region("maincpu", 0);
+}
+
+u8 hero1_state::expansion_r(offs_t offset)
+{
+	// ET-18-6 Figure 4: U102 owns the 4K $1000-$1FFF window; U103-U107
+	// own successive 8K windows through $BFFF.  A missing socket is open
+	// bus.  Each populated card performs its own address-pin mirroring.
+	if (offset < 0x1000)
+		return m_expansion[0]->read(offset);
+
+	const unsigned socket = 1 + ((offset - 0x1000) >> 13);
+	return m_expansion[socket]->read((offset - 0x1000) & 0x1fff);
+}
+
+void hero1_state::expansion_w(offs_t offset, u8 data)
+{
+	// U322 holds the board RAM R/W line high during logic sleep and the
+	// post-wake guard interval.  ROM cards ignore writes in their card
+	// implementation; empty sockets have no card to receive them.
+	if (m_ram_write_protected)
+		return;
+
+	if (offset < 0x1000)
+	{
+		m_expansion[0]->write(offset, data);
+		return;
+	}
+
+	const unsigned socket = 1 + ((offset - 0x1000) >> 13);
+	m_expansion[socket]->write((offset - 0x1000) & 0x1fff, data);
 }
 
 u8 hero1_state::display_memory_r(offs_t offset)
@@ -565,6 +800,14 @@ u8 hero1_state::display_memory_r(offs_t offset)
 
 void hero1_state::display_memory_w(offs_t offset, u8 data)
 {
+	// H1-TM printed p. 78 and H1-SCH4: C2E0 D4 high switches Q1202/Q1201
+	// and supplies +5 V to every circuit on the display board.  With D4 low,
+	// U1201-U1206 cannot latch writes.  The falling edge clears the modeled
+	// unpowered latch state in port_c2e0_system_select_w; that deterministic
+	// clear is not a claim about physical 74LS259 power-up values.
+	if (!BIT(m_manual_port_out[7], 4))
+		return;
+
 	const u16 address = 0xc10f + offset;
 	const int latch = (address >> 4) & 0x07;
 	const int digit = 6 - latch;
@@ -642,6 +885,13 @@ u8 hero1_state::keypad_column_r(int column)
 	if (column < 0 || column >= 3)
 		return 0xff;
 
+	// D4 removes the complete display-board +5 V rail, including keypad
+	// buffers and pull-ups (H1-TM p. 78; H1-SCH4 P1201/Q1201/Q1202).  Return
+	// the driver's deterministic open-high value rather than accepting a key
+	// closure through an unpowered board.
+	if (!BIT(m_manual_port_out[7], 4))
+		return 0xff;
+
 	return (m_key_columns[column]->read() & m_key_debug_columns[column]) | 0xc0;
 }
 
@@ -682,6 +932,9 @@ u8 hero1_state::sensor_r(offs_t offset)
 	case 0x0a: return BIT(m_pendant_port, 0) ? 1 : 0;
 	case 0x0b: return m_tape_in;
 	case 0x0c: return m_pendant_port;
+	case 0x0d: return m_experimental_input;
+	case 0x0e: return m_experimental_irq_line;
+	case 0x0f: return m_experimental_input_override ? 1 : 0;
 	default: return 0;
 	}
 }
@@ -769,6 +1022,12 @@ u8 hero1_state::port_c280_motion_r()
 
 u8 hero1_state::port_c2a0_experimental_r()
 {
+	// U301 is a live eight-line input buffer. An explicit debug-aperture
+	// stimulus owns all DI0-DI7 so conformance can exercise the socket byte
+	// exactly. Without that stimulus, preserve the existing serial/baud
+	// attachment wired to the same Experimental Board connector.
+	if (m_experimental_input_override)
+		return m_experimental_input;
 	return 0x78 | (m_basic_baud->read() & 0x07) | (m_experimental_serial_rxd ? 0x80 : 0x00);
 }
 
@@ -835,6 +1094,22 @@ void hero1_state::sensor_w(offs_t offset, u8 data)
 	case 0x0c:
 		update_pendant_port(data);
 		break;
+	case 0x0d:
+		// Driver-owned U301 DI0-DI7 aperture. This changes the live input
+		// lines only; it does not write CPU RAM or the $C2A0 main-drive latch.
+		m_experimental_input = data;
+		m_experimental_input_override = true;
+		break;
+	case 0x0e:
+	{
+		// P403 pin 28 is active low and clocks U410 on a high-to-low edge.
+		// U411 D7 clear/release is already enforced by latch_interrupt().
+		const u8 line = data ? 1 : 0;
+		if (m_experimental_irq_line && !line)
+			latch_interrupt(0x80);
+		m_experimental_irq_line = line;
+		break;
+	}
 	default:
 		break;
 	}
@@ -957,12 +1232,26 @@ void hero1_state::port_c2c0_select_strobe_w(u8 data)
 void hero1_state::port_c2e0_system_select_w(u8 data)
 {
 	const u8 previous_sonar_power = BIT(m_manual_port_out[7], 1) ? 1 : 0;
+	const u8 previous_display_power = BIT(m_manual_port_out[7], 4) ? 1 : 0;
+	const u8 previous_sleep_trigger = BIT(m_manual_port_out[7], 6) ? 1 : 0;
 	m_manual_port_out[7] = data;
 	m_port_outputs[7] = data;
+	const u8 display_power = BIT(data, 4) ? 1 : 0;
+	if (previous_display_power && !display_power)
+	{
+		// The switched board rail has fallen.  None of the six 74LS259s has
+		// retained power, so blank the published digits and discard the old
+		// latch contents.  Firmware must power and repaint the board; restoring
+		// stale emulator bytes on D4 rising would fabricate retention.
+		for (u8 &digit : m_display_memory)
+			digit = 0;
+		for (int digit = 0; digit < 6; digit++)
+			m_digits[digit] = 0;
+	}
 	const u8 previous_speech_power = m_speech_power;
 	m_speech_power = BIT(data, 3) ? 1 : 0;
 	update_speech_power();
-	driver_tracef("port_c2e0_system_select_w data=$%02X sonar_power=%u previous_sonar_power=%u speech_power=%u previous_speech_power=%u", data, BIT(data, 1), previous_sonar_power, m_speech_power, previous_speech_power);
+	driver_tracef("port_c2e0_system_select_w data=$%02X display_power=%u previous_display_power=%u sonar_power=%u previous_sonar_power=%u speech_power=%u previous_speech_power=%u", data, display_power, previous_display_power, BIT(data, 1), previous_sonar_power, m_speech_power, previous_speech_power);
 	if (previous_speech_power && !m_speech_power)
 	{
 		m_votrax->reset();
@@ -1012,6 +1301,102 @@ void hero1_state::port_c2e0_system_select_w(u8 data)
 		m_sonar_timer->adjust(attotime::never);
 		m_sonar_train_timer->adjust(attotime::never);
 	}
+
+	// U311 D6 is a rising-edge trigger into U321, not a level-valued main
+	// power gate (H1-TM printed pp. 81-82; H1-SCH3).  The one-shot owns the
+	// subsequent rail state and ignores further writes until it times out.
+	if (!previous_sleep_trigger && BIT(data, 6) && !m_logic_sleep_active)
+		logic_sleep_begin();
+}
+
+void hero1_state::logic_sleep_begin()
+{
+	m_logic_sleep_active = true;
+	m_ram_write_protected = true;
+	m_sleep_start_time_us = emulated_time_us(machine().time());
+	m_logic_sleep_out = 1;
+	m_ram_write_protected_out = 1;
+	m_sleep_start_time_us_out = m_sleep_start_time_us;
+	driver_tracef("logic_sleep_begin time_us=%d pc=$%04X", m_sleep_start_time_us, m_maincpu->pc() & 0xffff);
+
+	// U321/Q301 remove the main +5 V rail.  CPU execution and all main-rail
+	// periodic sources stop; RAM and mechanical pose are deliberately not
+	// touched.  Latch/device clears below are deterministic unpowered state,
+	// not firmware assistance or a claimed TTL power-up value.
+	m_maincpu->set_input_line(INPUT_LINE_RESET, ASSERT_LINE);
+	m_executive_timer->adjust(attotime::never);
+	m_sonar_timer->adjust(attotime::never);
+	m_sonar_train_timer->adjust(attotime::never);
+	m_wheel_timer->adjust(attotime::never);
+	m_sonar_ping_active = false;
+	m_wheel_pulse_pending = false;
+	m_interrupt_status = 0;
+	m_interrupt_clear_latch = 0xff;
+	update_irq_line();
+
+	for (u8 &digit : m_display_memory)
+		digit = 0;
+	for (int digit = 0; digit < 6; digit++)
+		m_digits[digit] = 0;
+	for (u8 &port : m_manual_port_out)
+		port = 0;
+	for (int port = 0; port < 8; port++)
+		m_port_outputs[port] = 0;
+	group_pattern_w(PGROUP_STEERING, 0x0f);
+	group_pattern_w(PGROUP_PIVOT_ROTATE, 0x00);
+	group_pattern_w(PGROUP_EXTEND_HEAD, 0x00);
+	group_pattern_w(PGROUP_GRIP_SHOULDER, 0x00);
+	update_drive_model();
+
+	m_speech_power = 0;
+	m_speech_request = 1;
+	m_speech_strobe_state = 0;
+	m_speech_phoneme = 0;
+	m_speech_inflection = 0;
+	m_speech_strobe = 0;
+	m_speech_ready = 1;
+	m_votrax->reset();
+	update_speech_power();
+	m_display_pia->reset();
+	m_keypad_pia->reset();
+	m_io_pia->reset();
+	m_speech_pia->reset();
+	m_rtc->reset();
+	m_clock_address = 0;
+	m_clock_control = 0;
+	m_rs232->write_txd(1);
+
+	m_logic_sleep_timer->adjust(attotime::from_seconds(10));
+	m_ram_write_enable_timer->adjust(attotime::never);
+}
+
+TIMER_CALLBACK_MEMBER(hero1_state::logic_sleep_wake_tick)
+{
+	// U321 section A times out and Q301 restores main +5 V.  The CPU does not
+	// execute immediately: H1-SCH2's U425B/C428 power-on reset network still
+	// holds U401 RESET while U322 keeps RAM R/W high for the independent
+	// ~100 ms supply-settling interval.  No bridge callback selects a PC.
+	m_logic_sleep_active = false;
+	m_wake_count++;
+	m_wake_time_us = emulated_time_us(machine().time());
+	m_logic_sleep_out = 0;
+	m_wake_time_us_out = m_wake_time_us;
+	m_wake_count_out = s32(m_wake_count & 0x7fffffff);
+	driver_tracef("logic_sleep_wake time_us=%d cycle=%u", m_wake_time_us, m_wake_count);
+	m_executive_timer->adjust(attotime::from_hz(1024), 0, attotime::from_hz(1024));
+	m_ram_write_enable_timer->adjust(attotime::from_msec(100));
+}
+
+TIMER_CALLBACK_MEMBER(hero1_state::ram_write_enable_tick)
+{
+	// U322 releases the retained RAM before the power-on reset network lets
+	// U401 fetch its reset vector.  This ordering is observable firmware
+	// behavior: v1.3 $F38B must decrement the retained sleep count at $000D;
+	// releasing RESET while R/W is still forced high repeats the sleep period.
+	m_ram_write_protected = false;
+	m_ram_write_protected_out = 0;
+	m_maincpu->set_input_line(INPUT_LINE_RESET, CLEAR_LINE);
+	driver_tracef("ram_write_enable time_us=%d", emulated_time_us(machine().time()));
 }
 
 void hero1_state::port_c300_clock_w(u8 data)
@@ -1241,6 +1626,7 @@ void hero1_state::axis_step(int axis, int direction)
 
 void hero1_state::update_irq_line()
 {
+	// H1-SCH2: U413/U414 combine the eight U410 source latches onto CPU IRQ*.
 	m_maincpu->set_input_line(INPUT_LINE_IRQ0, m_interrupt_status ? ASSERT_LINE : CLEAR_LINE);
 }
 
@@ -1391,6 +1777,13 @@ void hero1_state::hero1(machine_config &config)
 	M6808(config, m_maincpu, 4_MHz_XTAL);
 	m_maincpu->set_addrmap(AS_PROGRAM, &hero1_state::mem_map);
 
+	// ET-18-6 physical sockets.  No card is the stock/open-bus state.
+	// U102 has the manual's restricted population; U103-U107 accept the
+	// documented 6116, 6264, or ROM cards.
+	HERO1_MEMORY_SOCKET(config, m_expansion[0], hero1_u102_memory_devices);
+	for (unsigned socket = 1; socket < 6; socket++)
+		HERO1_MEMORY_SOCKET(config, m_expansion[socket], hero1_u103_u107_memory_devices);
+
 	SPEAKER(config, "mono").front_center();
 
 	PIA6821(config, m_display_pia);
@@ -1411,23 +1804,9 @@ void hero1_state::hero1(machine_config &config)
 	m_speech_pia->readpb_handler().set(FUNC(hero1_state::speech_pia_b_r));
 	m_speech_pia->writepb_handler().set(FUNC(hero1_state::speech_pia_b_w));
 
-	ACIA6850(config, m_acia, 0);
-	m_acia->irq_handler().set_inputline(m_maincpu, INPUT_LINE_IRQ0);
-	m_acia->txd_handler().set(m_rs232, FUNC(rs232_port_device::write_txd));
-	m_acia->rts_handler().set(m_rs232, FUNC(rs232_port_device::write_rts));
-
-	// Provisional cassette/serial ACIA clock: enough to exercise the MC6850
-	// transmit/receive state machines while the HERO 1 tape/serial clock source is verified.
-	clock_device &acia_clock(CLOCK(config, "acia_clock", 153600));
-	acia_clock.signal_handler().set(m_acia, FUNC(acia6850_device::write_txc));
-	acia_clock.signal_handler().append(m_acia, FUNC(acia6850_device::write_rxc));
-
 	RS232_PORT(config, m_rs232, default_rs232_devices, "terminal");
 	m_rs232->set_option_device_input_defaults("null_modem", DEVICE_INPUT_DEFAULTS_NAME(hero1_basic_serial));
-	m_rs232->rxd_handler().set(m_acia, FUNC(acia6850_device::write_rxd));
-	m_rs232->rxd_handler().append(FUNC(hero1_state::experimental_serial_rxd_w));
-	m_rs232->cts_handler().set(m_acia, FUNC(acia6850_device::write_cts));
-	m_rs232->dsr_handler().set(m_acia, FUNC(acia6850_device::write_dcd));
+	m_rs232->rxd_handler().set(FUNC(hero1_state::experimental_serial_rxd_w));
 
 	MSM5832(config, m_rtc, 32.768_kHz_XTAL);
 
@@ -1445,8 +1824,6 @@ ROM_START(hero1)
 	ROM_SYSTEM_BIOS(2, "v1u", "System ROM v1.U")
 	ROMX_LOAD("hero1_system_v1u.bin", 0x0000, 0x2000, CRC(7f1df589) SHA1(aacea2281d224c800377ebde01fdd3f52d61ff6e), ROM_BIOS(2))
 
-	ROM_REGION(0x2000, "basic", ROMREGION_ERASEFF)
-	ROM_LOAD("hero1_basic.bin", 0x0000, 0x1744, CRC(b10ed312) SHA1(0b85da5bd3fbcf0938ee77cfac615418d8ad8b9a))
 ROM_END
 
 } // anonymous namespace

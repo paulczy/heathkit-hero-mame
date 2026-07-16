@@ -100,6 +100,8 @@ local sensor_state = {
   soundLevel = 0,
   motionDetected = false,
   tapeIn = true,
+  experimentalInput = 0xff,
+  experimentalIrq = false,
   pendant = {
     ["function"] = "ARM",
     joint = "N",
@@ -1032,14 +1034,16 @@ local function herojr_d841_snapshot(port_prefix)
   --   bit 6 = Sleep/Norm switch (ioport read — side-effect-free, the same
   --           m_sleep_norm->read() the driver performs).
   local output = manager.machine.output
-  local port_b = output:get_indexed_value(port_prefix, 1) or 0
+  local driven = output:get_value("herojr_u215_port_b") or 0
+  local ddr = output:get_value("herojr_u215_ddr_b") or 0
   local adc_output = output:get_value("herojr_adc_output") or 0
   local sleep_norm = 1
   local port = manager.machine.ioport.ports[":SLEEP_NORM"] or manager.machine.ioport.ports["SLEEP_NORM"]
   if port then
     sleep_norm = port:read() & 0x01
   end
-  return (port_b & 0xaf) | (adc_output ~= 0 and 0x10 or 0x00) | (sleep_norm ~= 0 and 0x40 or 0x00)
+  local external_inputs = (adc_output ~= 0 and 0x10 or 0x00) | (sleep_norm ~= 0 and 0x40 or 0x00)
+  return driven | (external_inputs & (~ddr & 0xff))
 end
 
 local function herojr_d821_snapshot()
@@ -1171,6 +1175,8 @@ local function get_io_state()
   local motor_prefix = prefix .. "_motor_"
   local rs232_data = output_value(prefix .. "_rs232_data")
   local herojr_rs232_status = prefix == "herojr" and output_value(prefix .. "_rs232_status") or 0
+  local herojr_sw201_baud = prefix == "herojr" and output_value(prefix .. "_sw201_baud") or 0
+  local herojr_sw201_clock_hz = prefix == "herojr" and output_value(prefix .. "_sw201_clock_hz") or 0
   local digits = {}
   for i = 0, 5 do
     digits[#digits + 1] = indexed_output_value(led_prefix, i)
@@ -1207,6 +1213,11 @@ local function get_io_state()
   local herojr_d822 = prefix == "herojr" and read_u8(0xd822) or 0
   local herojr_d823 = prefix == "herojr" and herojr_d823_snapshot() or 0
   local herojr_d841 = prefix == "herojr" and herojr_d841_snapshot(port_prefix) or 0
+  if prefix == "herojr" then
+    -- All decoded sense/control fields describe physical U215 PB pins, not
+    -- the raw ORB latch. DDR input bits must not actuate attached hardware.
+    herojr_control = herojr_d841
+  end
   local herojr_d842 = prefix == "herojr" and herojr_d842_snapshot(port_prefix, speech_prefix) or 0
   local herojr_d843 = prefix == "herojr" and read_u8(0xd843) or 0
   local herojr_motion_detector = output_value(prefix .. "_motion_detector")
@@ -1229,11 +1240,20 @@ local function get_io_state()
   local herojr_power_cycles = output_value(prefix .. "_power_cycles")
   local experimental_output = prefix == "hero1" and indexed_output_value(port_prefix, 1) or 0
   local experimental_input = prefix == "hero1" and read_u8(0xc2a0) or 0
+  local experimental_input_lines = prefix == "hero1" and read_u8(sensor_base + 0x0d) or 0
+  local experimental_irq_line = prefix == "hero1" and read_u8(sensor_base + 0x0e) or 1
+  local experimental_input_override = prefix == "hero1" and read_u8(sensor_base + 0x0f) ~= 0 or false
   local experimental_interrupt_status = prefix == "hero1" and read_u8(0xc200) or 0
   local experimental_irq_vector = prefix == "hero1" and { read_u8(0x002d), read_u8(0x002e), read_u8(0x002f) } or { 0, 0, 0 }
   local speech_power = output_value(speech_prefix .. "power")
+  local logic_sleep_active = prefix == "hero1" and output_value(prefix .. "_logic_sleep_active") or 0
+  local ram_write_protected = prefix == "hero1" and output_value(prefix .. "_ram_write_protected") or 0
+  local sleep_start_time_us = prefix == "hero1" and output_value(prefix .. "_sleep_start_time_us") or 0
+  local wake_time_us = prefix == "hero1" and output_value(prefix .. "_wake_time_us") or 0
+  local wake_count = prefix == "hero1" and output_value(prefix .. "_wake_count") or 0
   local eye_ear_select = (system_select >> 7) & 0x01
-  local main_power = (system_select >> 6) & 0x01
+  local sleep_trigger = (system_select >> 6) & 0x01
+  local main_power = logic_sleep_active == 0 and 1 or 0
   local sense_power = (system_select >> 5) & 0x01
   local display_power = (system_select >> 4) & 0x01
   local motion_power = (system_select >> 2) & 0x01
@@ -1320,6 +1340,12 @@ local function get_io_state()
         systemSelect = system_select,
         eyeEarSelect = eye_ear_select,
         mainPower = main_power,
+        sleepTrigger = sleep_trigger,
+        logicSleepActive = logic_sleep_active,
+        ramWriteProtected = ram_write_protected,
+        sleepStartTimeUs = sleep_start_time_us,
+        wakeTimeUs = wake_time_us,
+        wakeCount = wake_count,
         sensePower = sense_power,
         displayPower = display_power,
         speechPower = speech_power,
@@ -1333,7 +1359,10 @@ local function get_io_state()
         outputAddress = 0xc220,
         inputPort = experimental_input,
         inputAddress = 0xc2a0,
-        inputMode = "floating/unmodeled",
+        inputLines = experimental_input_lines,
+        inputMode = experimental_input_override and "driver-backed" or "serial-baud-attachment",
+        irqLine = experimental_irq_line,
+        irqActiveLow = true,
         interruptStatus = experimental_interrupt_status,
         irqMask = 0x80,
         irqPending = (experimental_interrupt_status >> 7) & 0x01,
@@ -1397,7 +1426,9 @@ local function get_io_state()
         status = herojr_rs232_status,
         txData = rs232_data,
         txReady = (herojr_rs232_status >> 1) & 0x01,
-        rxReady = herojr_rs232_status & 0x01
+        rxReady = herojr_rs232_status & 0x01,
+        sw201Baud = herojr_sw201_baud,
+        clockHz = herojr_sw201_clock_hz
       },
       cartridge = {
         present = false,
@@ -1709,6 +1740,19 @@ local function set_sensor(params)
   elseif name == "tapeIn" then
     sensor_state.tapeIn = params.value and true or false
     write_u8(sensor_base + 0x0b, sensor_state.tapeIn and 1 or 0)
+  elseif name == "experimentalInput" then
+    if system_name() ~= "hero1" then
+      error("experimentalInput is a HERO 1 sensor")
+    end
+    sensor_state.experimentalInput = (tonumber(params.value) or 0) & 0xff
+    write_u8(sensor_base + 0x0d, sensor_state.experimentalInput)
+  elseif name == "experimentalIrq" then
+    if system_name() ~= "hero1" then
+      error("experimentalIrq is a HERO 1 sensor")
+    end
+    sensor_state.experimentalIrq = params.value and true or false
+    -- User-facing true means asserted; P403 pin 28 is electrically low.
+    write_u8(sensor_base + 0x0e, sensor_state.experimentalIrq and 0 or 1)
   end
   broadcast_io_changed(true)
   return {}
@@ -2432,10 +2476,11 @@ local function poll()
   end
 
   -- Stop detection MUST run before client requests are serviced (G2J-05 P0,
-  -- 2026-07-10, gate conformance-2026-07-09T23-50-08Z). With `-debugger none`
-  -- a stop auto-resumes (none.cpp wait_for_debugger() issues go()), so each
-  -- stop's ONLY detection chance is the single periodic_check pump inside
-  -- debugger_cpu::wait_for_debugger()'s stopped loop. When this function
+  -- 2026-07-10, gate conformance-2026-07-09T23-50-08Z). Upstream
+  -- `-debugger none` auto-resumes every stop. This fork preserves that default
+  -- only while the machine is unpaused; after emu.pause() below, the stopped
+  -- loop remains client-owned until `continue` unpauses and calls go(). Stop
+  -- identity must still be scanned before requests: when this function
   -- serviced requests first, a `continue` already queued on the socket —
   -- the client answering the PREVIOUS stop, with the two breakpoints only a
   -- few instructions apart ($9FDD/$9FE7) — flipped execution_state to "run"

@@ -56,6 +56,7 @@ public:
 		m_cart(*this, "cartslot"),
 		m_rtc(*this, "rtc"),
 		m_acia(*this, "acia"),
+		m_acia_clock(*this, "acia_clock"),
 		m_rs232(*this, "rs232"),
 		m_u214(*this, "u214"),
 		m_u215(*this, "u215"),
@@ -65,6 +66,7 @@ public:
 		m_sound_level(*this, "SOUND"),
 		m_sonar_distance(*this, "SONAR"),
 		m_sleep_norm(*this, "SLEEP_NORM"),
+		m_sw201(*this, "SW201"),
 		m_speech_phoneme(*this, "herojr_speech_phoneme"),
 		m_speech_inflection(*this, "herojr_speech_inflection"),
 		m_speech_strobe(*this, "herojr_speech_strobe"),
@@ -95,8 +97,12 @@ public:
 		m_power_cycles(*this, "herojr_power_cycles"),
 		m_u214_control_b_output(*this, "herojr_u214_control_b"),
 		m_u214_port_b_output(*this, "herojr_u214_port_b"),
+		m_u215_port_b_output(*this, "herojr_u215_port_b"),
+		m_u215_ddr_b_output(*this, "herojr_u215_ddr_b"),
 		m_rs232_status_output(*this, "herojr_rs232_status"),
 		m_rs232_data_output(*this, "herojr_rs232_data"),
+		m_sw201_baud_output(*this, "herojr_sw201_baud"),
+		m_sw201_clock_output(*this, "herojr_sw201_clock_hz"),
 		m_ram_top(*this, "herojr_ram_top"),
 		m_port_outputs(*this, "herojr_port_out_%u", 0U)
 	{
@@ -175,6 +181,9 @@ private:
 	void u215_speech_power_w(u8 data);
 	void u215_speech_control_w(u8 data);
 	void u215_sonar_echo_w(u8 data);
+	u8 u215_port_b_driven() const;
+	u8 u215_port_b_pins() const;
+	void apply_u215_port_b_lines(u8 previous_driven);
 	void rs232_w(offs_t offset, u8 data);
 	void speech_request_w(int state);
 	void acia_irq_w(int state);
@@ -191,6 +200,7 @@ private:
 	void update_u214_input_outputs();
 	void update_irq_line();
 	void update_speech_power();
+	void configure_sw201();
 	void set_sleep_norm_input(bool norm);
 	void reset_interface_state();
 	void set_reset_line(bool asserted);
@@ -218,6 +228,7 @@ private:
 	required_device<generic_slot_device> m_cart;
 	required_device<mc146818_device> m_rtc;
 	required_device<acia6850_device> m_acia;
+	required_device<clock_device> m_acia_clock;
 	required_device<rs232_port_device> m_rs232;
 	required_device<pia6821_device> m_u214;
 	required_device<pia6821_device> m_u215;
@@ -227,6 +238,7 @@ private:
 	required_ioport m_sound_level;
 	required_ioport m_sonar_distance;
 	required_ioport m_sleep_norm;
+	required_ioport m_sw201;
 
 	output_finder<> m_speech_phoneme;
 	output_finder<> m_speech_inflection;
@@ -294,8 +306,18 @@ private:
 	// recompose the 2026-07-03 side-effect audit reserved for the day U214
 	// grew latched flags).
 	output_finder<> m_u214_port_b_output;
+	// U215 port B witnesses for side-effect-free bridge composition. The
+	// Peripheral Register read clears IRQB1, so observers compose the pin
+	// image from ORB & DDRB plus live PB4/PB6 inputs instead of bus-reading.
+	output_finder<> m_u215_port_b_output;
+	output_finder<> m_u215_ddr_b_output;
 	output_finder<> m_rs232_status_output;
 	output_finder<> m_rs232_data_output;
+	// Physical SW201 jumper selection and the actual clock delivered to U216.
+	// These witnesses let the bridge prove that a requested nominal baud maps
+	// to the manual-derived +0.16% divider tap rather than a nominal shortcut.
+	output_finder<> m_sw201_baud_output;
+	output_finder<> m_sw201_clock_output;
 	// Top of populated RAM ($07FF stock / $3FFF expanded) for bridge truth.
 	output_finder<> m_ram_top;
 	output_finder<8> m_port_outputs;
@@ -456,8 +478,12 @@ void herojr_state::machine_start()
 	m_power_cycles.resolve();
 	m_u214_control_b_output.resolve();
 	m_u214_port_b_output.resolve();
+	m_u215_port_b_output.resolve();
+	m_u215_ddr_b_output.resolve();
 	m_rs232_status_output.resolve();
 	m_rs232_data_output.resolve();
+	m_sw201_baud_output.resolve();
+	m_sw201_clock_output.resolve();
 	m_port_outputs.resolve();
 
 	const char *const initial_sleep = osd_getenv("HEATHKIT_HEROJR_INITIAL_SLEEP");
@@ -510,6 +536,22 @@ void herojr_state::machine_start()
 
 	m_wheel_pulse_timer = timer_alloc(FUNC(herojr_state::wheel_pulse_tick), this);
 	m_sonar_echo_timer = timer_alloc(FUNC(herojr_state::sonar_echo_tick), this);
+}
+
+void herojr_state::configure_sw201()
+{
+	// SW201 positions, in screened order: U217 QC (2/13 MHz), U217 QD
+	// (1/13 MHz), then U218 O0-O4 (successive divide-by-two taps of QD).
+	// The MC6850 is programmed for /16 by the v1.6 ROM, so the actual baud
+	// values are all nominal +0.16%. MAME's clock_device accepts an integer
+	// rate; integer truncation is below one part in 2400 at the slowest tap.
+	static constexpr u32 nominal_baud[7] = { 9600, 4800, 2400, 1200, 600, 300, 150 };
+	const unsigned position = std::min<unsigned>(m_sw201->read() & 0x07, 6);
+	const u32 clock_hz = (4_MHz_XTAL / 26).value() >> position;
+	m_acia_clock->set_unscaled_clock(clock_hz);
+	m_sw201_baud_output = nominal_baud[position];
+	m_sw201_clock_output = clock_hz;
+	driver_tracef("SW201 position=%u nominal_baud=%u clock_hz=%u", position, nominal_baud[position], clock_hz);
 }
 
 void herojr_state::set_sleep_norm_input(bool norm)
@@ -596,6 +638,8 @@ void herojr_state::reset_interface_state()
 	m_drive_activity = 0;
 	m_u214_control_b_output = 0;
 	m_u214_port_b_output = 0;
+	m_u215_port_b_output = 0;
+	m_u215_ddr_b_output = 0;
 	for (int port = 0; port < 8; port++)
 		m_port_outputs[port] = 0;
 	m_sonar_echo_timer->adjust(attotime::never);
@@ -717,6 +761,10 @@ void herojr_state::set_reset_line(bool asserted)
 
 void herojr_state::machine_reset()
 {
+	// A physical SW201 jumper change is a power-down operation. Sample the
+	// configuration on reset, after MAME has made input ports safe to read.
+	configure_sw201();
+
 	// Power-up: the U222 latch settles in the awake state — its wake-side
 	// inputs are R209/R214 10K pull-ups and CA2 is undriven until the ROM's
 	// $EB8B init (undriven ⇒ on: every operator boot crosses that window;
@@ -1250,13 +1298,16 @@ void herojr_state::update_u214_input_outputs()
 // adc-encoder spec §5.1 — "every wheel-encoder pulse interrupts the CPU",
 // the $D17F dispatcher's first check). The RTC's own IRQ* pin (U213-19) is
 // NOT on this net: it feeds the sleep-mode wake circuit (U222A) only
-// (G2J-08). (U215's IRQA wiring to the CPU awaits JR-TM adjudication,
-// tech-debt §2 — unchanged here.)
+// (G2J-08). U215 IRQA* is also tied to this shared CPU IRQ* net; IRQB*
+// is unconnected (JR-SCH CPU-board sheet 3).
 void herojr_state::update_irq_line()
 {
 	const bool u214_irq_a = m_u214_ca1_flag && BIT(m_u214_control_a, 0);
 	const bool u214_irq_b = m_u214_cb1_flag && BIT(m_u214_control_b, 0);
-	m_maincpu->set_input_line(INPUT_LINE_IRQ0, (u214_irq_a || u214_irq_b || m_acia_irq_state) ? ASSERT_LINE : CLEAR_LINE);
+	// JR-SCH sheet 3 ties U215 IRQA* pin 38 to this shared net; U215
+	// IRQB* pin 37 is unconnected.
+	const bool u215_irq_a = m_speech_request_flag && BIT(m_u215_control_a, 0);
+	m_maincpu->set_input_line(INPUT_LINE_IRQ0, (u214_irq_a || u214_irq_b || u215_irq_a || m_acia_irq_state) ? ASSERT_LINE : CLEAR_LINE);
 }
 
 // U213 SQW (pin 23) → U211D inverter → U214 CA1 (pin 40): "The output of
@@ -1323,8 +1374,12 @@ u8 herojr_state::u215_speech_data_r()
 	{
 		m_speech_request_flag = 0;
 		m_speech_request_flag_output = 0;
+		update_irq_line();
 	}
-	return m_speech_data;
+	// U215 PA0-PA7 are outputs in the ROM's normal DDRA=$FF state. In
+	// input-configured positions the attached speech/LED loads do not drive
+	// data back onto the bus, so the pin contribution is low.
+	return m_speech_data & m_u215_ddr_a;
 }
 
 u8 herojr_state::u215_speech_power_r()
@@ -1354,7 +1409,7 @@ u8 herojr_state::u215_speech_power_r()
 	// line is wired to CA1 (U215-40, $D842 bit 7), NOT to any $D841 bit, so do
 	// not mirror m_speech_request onto PB0 - that fabricates a connection the
 	// hardware does not have and races the firmware's $F067 busy-flag poll.
-	return (m_u215_port_b & 0xaf) | (m_adc_output_state ? 0x10 : 0x00) | (m_sleep_norm->read() ? 0x40 : 0x00);
+	return u215_port_b_pins();
 }
 
 u8 herojr_state::u215_speech_control_r()
@@ -1398,15 +1453,21 @@ void herojr_state::u215_speech_data_w(u8 data)
 	if (!BIT(m_u215_control_a, 2))
 	{
 		m_u215_ddr_a = data;
+		const u8 driven = m_speech_data & m_u215_ddr_a;
+		m_port_outputs[0] = driven;
+		set_speech_data(driven);
 		return;
 	}
 
-	m_port_outputs[0] = data;
-	set_speech_data(data);
+	m_speech_data = data;
+	const u8 driven = m_speech_data & m_u215_ddr_a;
+	m_port_outputs[0] = driven;
+	set_speech_data(driven);
 }
 
 void herojr_state::u215_speech_power_w(u8 data)
 {
+	const u8 previous_driven = u215_port_b_driven();
 	if (!BIT(m_u215_control_b, 2))
 	{
 		// CRB bit 2 selects DDRB; the ROM's only DDR write is the boot
@@ -1415,16 +1476,34 @@ void herojr_state::u215_speech_power_w(u8 data)
 		// PB0 clear, speech power off — and the firmware powers the
 		// SC-01 per utterance through its $EF6F helper.
 		m_u215_ddr_b = data;
+		apply_u215_port_b_lines(previous_driven);
 		return;
 	}
 
-	const u8 previous_port = m_u215_port_b;
-	m_port_outputs[1] = data;
 	m_u215_port_b = data;
-	const u8 previous_speech_power = m_speech_power_state;
-	m_speech_power_state = BIT(data, 1) ? 1 : 0;
+	apply_u215_port_b_lines(previous_driven);
+}
+
+u8 herojr_state::u215_port_b_driven() const
+{
+	return m_u215_port_b & m_u215_ddr_b;
+}
+
+u8 herojr_state::u215_port_b_pins() const
+{
+	const u8 external_inputs = (m_adc_output_state ? 0x10 : 0x00) | (m_sleep_norm->read() ? 0x40 : 0x00);
+	return u215_port_b_driven() | (external_inputs & ~m_u215_ddr_b);
+}
+
+void herojr_state::apply_u215_port_b_lines(u8 previous_driven)
+{
+	const u8 driven = u215_port_b_driven();
+	m_port_outputs[1] = m_u215_port_b;
+	m_u215_port_b_output = driven;
+	m_u215_ddr_b_output = m_u215_ddr_b;
+	m_speech_power_state = BIT(driven, 1) ? 1 : 0;
 	m_speech_power = m_speech_power_state;
-	if (BIT(data, 3) != BIT(previous_port, 3))
+	if (BIT(driven, 3) != BIT(previous_driven, 3))
 		start_adc_conversion();
 	// Shared-line truth (JR-TM printed p. 23 / PDF p. 25): PB5 is both the
 	// A/D clock and the sonar blanking gate ("the same line that is used for
@@ -1434,7 +1513,7 @@ void herojr_state::u215_speech_power_w(u8 data)
 	// anchored at INIT (arm_sonar_cycle) and an echo arriving while PB5 is
 	// still high is absorbed by the blanking mask — sonar spec §3.3(b)/§4
 	// as re-adjudicated 2026-07-02.
-	if (BIT(previous_port, 5) && !BIT(data, 5))
+	if (BIT(previous_driven, 5) && !BIT(driven, 5))
 		clock_adc_bit();
 	// $D841 D1 switches Q204/Q205 — the AUDIO rail only. R226 maintains
 	// power to U223 itself when they are off and D203 isolates that
@@ -1450,7 +1529,8 @@ void herojr_state::u215_speech_control_w(u8 data)
 	const u8 previous_control = m_u215_control_a;
 	m_u215_control_a = data & 0x3f;
 	const u8 previous_strobe = m_speech_strobe_state;
-	const u8 requested_strobe = BIT(data, 3) ? 1 : 0;
+	const bool ca2_set_reset_output = BIT(data, 5) && BIT(data, 4);
+	const u8 requested_strobe = ca2_set_reset_output && BIT(data, 3) ? 1 : 0;
 	m_speech_strobe_state = requested_strobe;
 	m_speech_strobe = m_speech_strobe_state;
 	driver_tracef("u215_speech_control_w data=$%02X previous_control=$%02X control_a=$%02X strobe=%u previous_strobe=%u request_flag=%u", data, previous_control, m_u215_control_a, requested_strobe, previous_strobe, m_speech_request_flag);
@@ -1462,6 +1542,9 @@ void herojr_state::u215_speech_control_w(u8 data)
 	// CA2 high so the idle $D31B heartbeat pass produces no further edge.
 	if (requested_strobe && !previous_strobe)
 		latch_speech_phoneme();
+	// JR-SCH sheet 3 ties U215 IRQA* pin 38 to the shared CPU IRQ* net;
+	// IRQB* pin 37 is unconnected. CRA bit 0 gates a pending CA1 flag.
+	update_irq_line();
 }
 
 void herojr_state::u215_sonar_echo_w(u8 data)
@@ -1531,6 +1614,7 @@ void herojr_state::speech_request_w(int state)
 	{
 		m_speech_request_flag = 1;
 		m_speech_request_flag_output = m_speech_request_flag;
+		update_irq_line();
 	}
 }
 
@@ -1542,7 +1626,6 @@ void herojr_state::acia_irq_w(int state)
 
 void herojr_state::set_speech_data(u8 data)
 {
-	m_speech_data = data;
 	m_speech_phoneme = data & 0x3f;
 	m_speech_inflection = (data >> 6) & 0x03;
 }
@@ -1561,18 +1644,19 @@ void herojr_state::latch_speech_phoneme()
 	}
 	m_phoneme_seq_count++;
 	m_phoneme_seq = s32(m_phoneme_seq_count & 0x7fffffff);
-	m_phoneme_byte = m_speech_data;
+	const u8 speech_bus = m_speech_data & m_u215_ddr_a;
+	m_phoneme_byte = speech_bus;
 	m_phoneme_time_us = emulated_time_us(machine().time());
 
-	m_votrax->inflection_w((m_speech_data >> 6) & 0x03);
-	m_votrax->write(m_speech_data & 0x3f);
+	m_votrax->inflection_w((speech_bus >> 6) & 0x03);
+	m_votrax->write(speech_bus & 0x3f);
 }
 
 u8 herojr_state::selected_adc_sample() const
 {
 	// HERO Jr Technical Manual pp. 21-22: $D841 D2 selects light when high
 	// and sound when low before U306 shifts the serial ADC result back.
-	return BIT(m_u215_port_b, 2) ? m_light_sample : m_sound_sample;
+	return BIT(u215_port_b_driven(), 2) ? m_light_sample : m_sound_sample;
 }
 
 void herojr_state::start_adc_conversion()
@@ -1657,7 +1741,7 @@ void herojr_state::arm_sonar_cycle()
 {
 	m_sonar_distance_output = m_sonar_distance_sample;
 	m_sonar_init_time_us = emulated_time_us(machine().time());
-	driver_tracef("arm_sonar_cycle distance=%u pb5=%u control_b=$%02X port_b=$%02X", m_sonar_distance_sample, BIT(m_u215_port_b, 5), m_u214_control_b, m_u214_port_b);
+	driver_tracef("arm_sonar_cycle distance=%u pb5=%u control_b=$%02X port_b=$%02X", m_sonar_distance_sample, BIT(u215_port_b_driven(), 5), m_u214_control_b, m_u214_port_b);
 	m_sonar_echo_timer->adjust(attotime::from_ticks(2 * u64(m_sonar_distance_sample), 13032));
 }
 
@@ -1680,7 +1764,7 @@ void herojr_state::update_speech_power()
 // 25 feet"; spec §3.3(b)/§4 re-adjudication, 2026-07-02).
 TIMER_CALLBACK_MEMBER(herojr_state::sonar_echo_tick)
 {
-	if (BIT(m_u215_port_b, 5))
+	if (BIT(u215_port_b_driven(), 5))
 	{
 		driver_tracef("sonar_echo_tick blanked distance=%u port_b=$%02X", m_sonar_distance_sample, m_u215_port_b);
 		return;
@@ -1741,6 +1825,16 @@ static INPUT_PORTS_START(herojr)
 
 	PORT_START("RESET")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("RESET") PORT_CODE(KEYCODE_BACKSPACE) PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(herojr_state::reset_changed), 0)
+
+	PORT_START("SW201")
+	PORT_CONFNAME(0x07, 0x00, "SW201 RS-232 baud jumper")
+	PORT_CONFSETTING(0x00, "9600")
+	PORT_CONFSETTING(0x01, "4800")
+	PORT_CONFSETTING(0x02, "2400")
+	PORT_CONFSETTING(0x03, "1200")
+	PORT_CONFSETTING(0x04, "600")
+	PORT_CONFSETTING(0x05, "300")
+	PORT_CONFSETTING(0x06, "150")
 INPUT_PORTS_END
 
 static DEVICE_INPUT_DEFAULTS_START(herojr_rs232)
@@ -1801,10 +1895,11 @@ void herojr_state::herojr(machine_config &config)
 	// SW201 rate runs +0.16% of nominal (13 x 16 = 208 does not divide
 	// 10^6). QC's irregular duty (4/4/5 us intervals) is modeled as a
 	// uniform clock: firmware-invisible through the 6850's /16 edge
-	// counter. Only the 9600 position is modeled (tech-debt item 10).
-	clock_device &acia_clock(CLOCK(config, "acia_clock", 4_MHz_XTAL / 26));
-	acia_clock.signal_handler().set(m_acia, FUNC(acia6850_device::write_txc));
-	acia_clock.signal_handler().append(m_acia, FUNC(acia6850_device::write_rxc));
+	// counter. configure_sw201() selects QC, QD, or U218 O0-O4 from the
+	// physical MAME configuration jumper at power-up.
+	CLOCK(config, m_acia_clock, 4_MHz_XTAL / 26);
+	m_acia_clock->signal_handler().set(m_acia, FUNC(acia6850_device::write_txc));
+	m_acia_clock->signal_handler().append(m_acia, FUNC(acia6850_device::write_rxc));
 
 	RS232_PORT(config, m_rs232, default_rs232_devices, "terminal");
 	m_rs232->set_option_device_input_defaults("null_modem", DEVICE_INPUT_DEFAULTS_NAME(herojr_rs232));

@@ -47,7 +47,11 @@ void debug_none::init_debugger(running_machine &machine)
 
 void debug_none::wait_for_debugger(device_t &device, bool firststop)
 {
-	m_machine->debugger().console().get_visible_cpu()->debug()->go();
+	// The HERO bridge pauses the machine when it broadcasts a debugger stop,
+	// then services requests from periodic_check() in the stopped loop.  Do
+	// not defeat that client-owned stop; `continue` unpauses and calls go().
+	if (!m_machine->paused())
+		m_machine->debugger().console().get_visible_cpu()->debug()->go();
 }
 
 void debug_none::debugger_update()
